@@ -16,5 +16,3 @@ tmp/
 /pr-*-gate*.json
 /pr-*-review*.md
 
-# [aiti] build output (publish artifact, never committed)
-/dist/
