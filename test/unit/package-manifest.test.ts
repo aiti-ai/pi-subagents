@@ -103,6 +103,7 @@ test("published extension APIs use supported package entrypoints", async () => {
 	assert.equal(fs.existsSync(path.join(projectRoot, "src", "api", "delegation.ts")), true);
 	assert.deepEqual(packageJson.exports, {
 		".": "./index.ts",
+		"./host": "./src/host/index.ts",
 		"./agents": "./src/api/agents.ts",
 		"./background-work": "./src/api/background-work.ts",
 		"./external-job-provider": "./src/api/external-job-provider.ts",
@@ -116,43 +117,43 @@ test("published extension APIs use supported package entrypoints", async () => {
 		"./shared-types": "./src/api/shared-types.ts",
 		"./project-panes": "./src/api/project-panes.ts",
 	});
-	const agents = await import("pi-subagents/agents");
+	const agents = await import("@aiti-ai/pi-subagents/agents");
 	assert.equal(agents.RUNTIME_AGENT_REGISTER_EVENT, "pi-subagents:runtime-agent-register:v1");
 	assert.equal(agents.RUNTIME_AGENT_REGISTER_VERSION, 1);
 	assert.equal(typeof agents.registerAgentViaEvents, "function");
-	const backgroundWork = await import("pi-subagents/background-work");
+	const backgroundWork = await import("@aiti-ai/pi-subagents/background-work");
 	assert.equal(backgroundWork.BACKGROUND_WORK_PROTOCOL_VERSION, 1);
 	assert.equal(backgroundWork.BACKGROUND_WORK_REGISTRY_KEY, "pi-subagents.background-work.v1");
-	const externalJobProvider = await import("pi-subagents/external-job-provider");
+	const externalJobProvider = await import("@aiti-ai/pi-subagents/external-job-provider");
 	assert.equal(externalJobProvider.EXTERNAL_JOB_PROVIDER_PROTOCOL_VERSION, 1);
 	assert.equal(externalJobProvider.EXTERNAL_JOB_PROVIDER_REGISTRY_KEY, "pi-subagents.external-job-providers.v1");
 	assert.equal(typeof externalJobProvider.registerExternalJobProvider, "function");
-	const externalRuns = await import("pi-subagents/external-runs");
+	const externalRuns = await import("@aiti-ai/pi-subagents/external-runs");
 	assert.equal(externalRuns.EXTERNAL_RUN_REGISTRY_VERSION, 2);
 	assert.equal(typeof externalRuns.registerExternalRun, "function");
 	assert.equal(typeof externalRuns.updateExternalRun, "function");
 	assert.equal(typeof externalRuns.snapshotExternalRuns, "function");
 	assert.equal(typeof externalRuns.unregisterExternalRun, "function");
-	const capability = await import("pi-subagents/capability-ceiling");
+	const capability = await import("@aiti-ai/pi-subagents/capability-ceiling");
 	assert.equal(capability.SUBAGENT_CAPABILITY_CEILING_VERSION, 1);
 	assert.equal(capability.SUBAGENT_CAPABILITY_CEILING_REGISTRY_KEY, "pi-subagents.capability-ceiling.v1");
-	const delegation = await import("pi-subagents/delegation");
+	const delegation = await import("@aiti-ai/pi-subagents/delegation");
 	assert.equal(delegation.SUBAGENT_DELEGATION_REQUEST_EVENT, "prompt-template:subagent:request");
-	const preflight = await import("pi-subagents/preflight");
+	const preflight = await import("@aiti-ai/pi-subagents/preflight");
 	assert.equal(preflight.SUBAGENT_LAUNCH_CONTRACT_VERSION, 2);
 	assert.equal(typeof preflight.resolveSubagentLaunchContract, "function");
-	const controlChannel = await import("pi-subagents/control-channel");
+	const controlChannel = await import("@aiti-ai/pi-subagents/control-channel");
 	assert.equal(typeof controlChannel.requestAsyncStop, "function");
-	const intercomBridge = await import("pi-subagents/intercom-bridge");
+	const intercomBridge = await import("@aiti-ai/pi-subagents/intercom-bridge");
 	assert.equal(typeof intercomBridge.resolveIntercomSessionTarget, "function");
-	const piArgs = await import("pi-subagents/pi-args");
+	const piArgs = await import("@aiti-ai/pi-subagents/pi-args");
 	assert.equal(typeof piArgs.resolvePiLaunchToolPlan, "function");
 	assert.equal("buildPiArgs" in piArgs, false);
-	const sharedTypes = await import("pi-subagents/shared-types");
+	const sharedTypes = await import("@aiti-ai/pi-subagents/shared-types");
 	assert.equal(typeof sharedTypes.wrapForkTask, "function");
 	assert.equal(typeof sharedTypes.DEFAULT_FORK_PREAMBLE, "string");
 	assert.equal("TEMP_ROOT_DIR" in sharedTypes, false);
-	const projectPanes = await import("pi-subagents/project-panes");
+	const projectPanes = await import("@aiti-ai/pi-subagents/project-panes");
 	assert.equal(projectPanes.PROJECT_PANES_API_VERSION, 1);
 	assert.equal(typeof projectPanes.openProjectPane, "function");
 	assert.equal(typeof projectPanes.getProjectPaneStatus, "function");
