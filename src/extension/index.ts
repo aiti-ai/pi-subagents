@@ -56,6 +56,7 @@ import { createWaitSubscriptionManager } from "../runs/background/wait-subscript
 import { drainOutstandingWork } from "../runs/background/auto-drain.ts";
 import registerSubagentNotify, { parseSubagentNotifyContent, type SubagentNotifyDetails } from "../runs/background/notify.ts";
 import { formatSteeringNotice, handleSubagentSteeringNotice, SUBAGENT_STEERING_MESSAGE_TYPE, type SubagentSteeringMessageDetails } from "./steering-notices.ts";
+import { resolveHostCaps } from "../host/caps.ts"; // [aiti] 宿主能力门控（pi-web 下关闭 TUI 载体面）
 import { SUBAGENT_CHILD_ENV, SUBAGENT_PARENT_SESSION_ENV } from "../runs/shared/pi-args.ts";
 import { resolveCurrentSubagentCapabilityCeiling } from "../runs/shared/capability-ceiling.ts";
 import { formatDuration, shortenPath } from "../shared/formatters.ts";
@@ -412,9 +413,9 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 	applyModelExclusionsConfig(config);
 	const waitToolConfig = resolveWaitToolConfig(config.waitTool);
 	const asyncByDefault = resolveAsyncByDefault(config);
-	const fleetViewEnabled = config.fleetView !== false;
+	const fleetViewEnabled = config.fleetView !== false && resolveHostCaps().tui; // [aiti] 非 TUI 宿主关闭（Web Fleet 面板替代）
 	const fleetViewPlacement = resolveFleetViewPlacement(config.fleetViewPlacement);
-	const asyncWidgetEnabled = config.asyncWidget !== false;
+	const asyncWidgetEnabled = config.asyncWidget !== false && resolveHostCaps().widget; // [aiti] 非 TUI 宿主关闭
 	const summaryInlineToolDisplay = config.inlineToolDisplay === "summary";
 	const tempArtifactsDir = getArtifactsDir(null);
 	const artifactCleanupDays = config.artifactConfig?.cleanupDays ?? DEFAULT_ARTIFACT_CONFIG.cleanupDays;
@@ -755,10 +756,12 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 		}
 	});
 
-	registerSlashCommands(pi, state, {
-		fleetKeybindings: config.fleetKeybindings,
-		foregroundDetachShortcut: config.foregroundDetachShortcut,
-	});
+	if (resolveHostCaps().slash) {
+		registerSlashCommands(pi, state, {
+			fleetKeybindings: config.fleetKeybindings,
+			foregroundDetachShortcut: config.foregroundDetachShortcut,
+		});
+	} // [aiti] 非 TUI 宿主不注册 slash
 
 	let visibleControlNotices = new Set<string>();
 	const activeHerdrRuns = () => projectActiveHerdrRuns(state);

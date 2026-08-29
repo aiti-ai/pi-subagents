@@ -57,6 +57,26 @@ test("L0-4: package.json 发布面完整（@aiti-ai scope + -aiti.N 版本 + ./h
 	assert.equal(pkg.exports["./host"], "./src/host/index.ts", "./host export 必须存在（pi-web 接入面）");
 });
 
+test("L0-6: 载体面插桩保持（fleetView/asyncWidget/slash 经 host caps 门控）", async () => {
+  const file = join(ROOT, "src", "extension", "index.ts");
+  const source = await readFile(file, "utf8");
+  assert.match(
+    source,
+    /const fleetViewEnabled = config\.fleetView !== false && resolveHostCaps\(\)\.tui;/,
+    "插桩丢失：fleetViewEnabled 应受 host caps 门控",
+  );
+  assert.match(
+    source,
+    /const asyncWidgetEnabled = config\.asyncWidget !== false && resolveHostCaps\(\)\.widget;/,
+    "插桩丢失：asyncWidgetEnabled 应受 host caps 门控",
+  );
+  assert.match(
+    source,
+    /if \(resolveHostCaps\(\)\.slash\) \{\n\t\tregisterSlashCommands/,
+    "插桩丢失：registerSlashCommands 应受 host caps 门控",
+  );
+});
+
 test("L0-5: host 层文件只允许出现在 src/host/**（新文件隔离纪律）", async () => {
 	// 守护「改动外部化」：host 契约的实现在且只在本目录，防止未来散落。
 	const hostIndex = await readFile(join(ROOT, "src", "host", "index.ts"), "utf8");
