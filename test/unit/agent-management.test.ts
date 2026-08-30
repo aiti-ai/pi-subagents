@@ -60,6 +60,54 @@ describe("agent management config parsing", () => {
 		assert.doesNotMatch(readText(result), /- scout \(builtin/);
 	});
 
+	it("lists compact declared capabilities without exposing system prompts", () => {
+		const agentsDir = path.join(tempDir, ".pi", "agents");
+		fs.mkdirSync(agentsDir, { recursive: true });
+		fs.writeFileSync(path.join(agentsDir, "capability-worker.md"), [
+			"---",
+			"name: capability-worker",
+			"description: Capability worker",
+			"aliases: capability",
+			"tools: read, grep, mcp:github/search",
+			"model: openai/gpt-5-mini",
+			"fallbackModels: openai/gpt-5-mini-fallback",
+			"async: true",
+			"timeoutMs: 123",
+			"thinking: high",
+			"skills: typescript-code",
+			"extensions: github",
+			"subagentOnlyExtensions: surf",
+			"mutationTools: edit, write",
+			"output: report.md",
+			"outputMode: file-only",
+			"---",
+			"SYSTEM_PROMPT_SENTINEL",
+			"---",
+		].join("\n"));
+
+		const capabilityRequest = { agentScope: "project", capabilities: true };
+		const listed = handleManagementAction("list", capabilityRequest, {
+			cwd: tempDir,
+			modelRegistry: { getAvailable: () => [] },
+		});
+		assert.equal(listed.isError, false);
+		const text = readText(listed);
+		assert.match(text, /^Executable agents \(capabilities\):/);
+		assert.match(text, /- capability-worker \(project, aliases: capability\): Description: Capability worker; Tools: read, grep, mcp:github\/search; Model: openai\/gpt-5-mini; Thinking: high/);
+		assert.doesNotMatch(text, /System Prompt:|SYSTEM_PROMPT_SENTINEL/);
+		const capabilities = listed.details?.agentCapabilities;
+		assert.ok(capabilities);
+		const row = capabilities.agents.find((agent) => agent.name === "capability-worker");
+		assert.ok(row);
+		assert.equal(row.executable, true);
+		assert.deepEqual(row.tools, { ambient: false, names: ["read", "grep"], mcpDirectTools: ["github/search"], mutationTools: ["edit", "write"] });
+		assert.deepEqual(row.model, { value: "openai/gpt-5-mini", fallbackModels: ["openai/gpt-5-mini-fallback"], thinking: "high" });
+		assert.deepEqual(row.execution, { defaultAsync: true, timeoutMs: 123 });
+		assert.deepEqual(row.output, { path: "report.md", mode: "file-only" });
+		assert.deepEqual(row.extensions, { names: ["github"], subagentOnly: ["surf"], skills: ["typescript-code"] });
+		assert.equal(JSON.stringify(capabilities).includes("SYSTEM_PROMPT_SENTINEL"), false);
+	});
+
 	it("rejects management attempts to widen the reserved read-only Claude profile", () => {
 		const ctx = { cwd: tempDir, modelRegistry: { getAvailable: () => [] } };
 		const writerRunner = { type: "external-cli", adapter: "claude-code-writer", command: "claude" };
@@ -548,7 +596,6 @@ Advise only.
 					scope: "project",
 					async: false,
 					timeoutMs: 120_000,
-					turnBudget: { maxTurns: 8, graceTurns: 2 },
 					acceptance: { level: "none", reason: "lightweight reviewer" },
 					outputMode: "file-only",
 				},
@@ -561,7 +608,6 @@ Advise only.
 		let content = fs.readFileSync(filePath, "utf-8");
 		assert.match(content, /^async: false$/m);
 		assert.match(content, /^timeoutMs: 120000$/m);
-		assert.match(content, /^turnBudget: \{"maxTurns":8,"graceTurns":2\}$/m);
 		assert.match(content, /^acceptance: \{"level":"none","reason":"lightweight reviewer"\}$/m);
 		assert.match(content, /^outputMode: file-only$/m);
 
@@ -569,19 +615,17 @@ Advise only.
 		assert.equal(got.isError, false);
 		assert.match(readText(got), /Async: false/);
 		assert.match(readText(got), /Timeout: 120000ms/);
-		assert.match(readText(got), /Turn budget: \{"maxTurns":8,"graceTurns":2\}/);
 		assert.match(readText(got), /Acceptance: \{"level":"none","reason":"lightweight reviewer"\}/);
 		assert.match(readText(got), /Output mode: file-only/);
 
 		const updated = handleUpdate(
-			{ agent: "background-reviewer", config: { async: true, timeoutMs: false, turnBudget: false, acceptance: "", outputMode: "inline" } },
+			{ agent: "background-reviewer", config: { async: true, timeoutMs: false, acceptance: "", outputMode: "inline" } },
 			ctx,
 		);
 		assert.equal(updated.isError, false);
 		content = fs.readFileSync(filePath, "utf-8");
 		assert.match(content, /^async: true$/m);
 		assert.doesNotMatch(content, /^timeoutMs:/m);
-		assert.doesNotMatch(content, /^turnBudget:/m);
 		assert.doesNotMatch(content, /^acceptance:/m);
 		assert.match(content, /^outputMode: inline$/m);
 

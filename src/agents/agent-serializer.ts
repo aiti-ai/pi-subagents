@@ -9,6 +9,7 @@ export const KNOWN_FIELDS = new Set([
 	"alias",
 	"aliases",
 	"tools",
+	"allowNestedSubagents",
 	"model",
 	"fallbackModels",
 	"fast",
@@ -21,7 +22,6 @@ export const KNOWN_FIELDS = new Set([
 	"async",
 	"timeoutMs",
 	"toolTimeoutMs",
-	"turnBudget",
 	"acceptance",
 	"acceptanceRole",
 	"skill",
@@ -70,6 +70,9 @@ export function serializeAgent(config: AgentConfig, options: SerializeAgentOptio
 	];
 	const toolsValue = joinComma(tools);
 	if (toolsValue || preserve("tools")) lines.push(`tools: ${toolsValue ?? ""}`);
+	if (config.allowNestedSubagents === true || preserve("allowNestedSubagents")) {
+		lines.push(`allowNestedSubagents: ${config.allowNestedSubagents === undefined ? "" : config.allowNestedSubagents ? "true" : "false"}`);
+	}
 
 	if (config.model || preserve("model")) lines.push(`model: ${config.model ?? ""}`);
 	const fallbackModelsValue = joinComma(config.fallbackModels);
@@ -94,7 +97,6 @@ export function serializeAgent(config: AgentConfig, options: SerializeAgentOptio
 	if (config.defaultAsync !== undefined || preserve("async")) lines.push(`async: ${config.defaultAsync === undefined ? "" : config.defaultAsync ? "true" : "false"}`);
 	if (config.defaultTimeoutMs !== undefined || preserve("timeoutMs")) lines.push(`timeoutMs: ${config.defaultTimeoutMs ?? ""}`);
 	if (config.defaultToolTimeoutMs !== undefined || preserve("toolTimeoutMs")) lines.push(`toolTimeoutMs: ${config.defaultToolTimeoutMs ?? ""}`);
-	if (config.defaultTurnBudget || preserve("turnBudget")) lines.push(`turnBudget: ${config.defaultTurnBudget ? JSON.stringify(config.defaultTurnBudget) : ""}`);
 	if (config.defaultAcceptance !== undefined || preserve("acceptance")) {
 		lines.push(`acceptance: ${config.defaultAcceptance === undefined
 			? ""

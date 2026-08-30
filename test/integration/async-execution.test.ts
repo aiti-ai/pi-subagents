@@ -26,6 +26,7 @@ import { resolveSubagentLaunchContract } from "../../src/api/preflight.ts";
 import { discoverAgents } from "../../src/agents/agents.ts";
 import { runSync } from "../../src/runs/foreground/execution.ts";
 import { ACTIVE_ASYNC_CAPACITY_DIR, acquireActiveAsyncCapacity, activeAsyncCapacitySessionKey } from "../../src/runs/background/active-async-capacity.ts";
+import { deriveForkPromptCacheKey, SUBAGENT_FORK_CACHE_KEY_ENV } from "../../src/runs/shared/pi-args.ts";
 
 interface LaunchResolvedExtensions {
 	version?: number;
@@ -80,7 +81,7 @@ interface AsyncResultPayload {
 	totalTokens?: { input: number; output: number; total: number };
 	totalCost?: { inputTokens: number; outputTokens: number; costUsd: number };
 	usageBudget?: UsageBudgetState;
-	results: Array<{ agent?: string; launchContractDigest?: string; launchResolvedExtensions?: LaunchResolvedExtensions; runtimeAcknowledgedExtensions?: RuntimeAcknowledgedExtensions; output?: string; outputState?: "present" | "absent" | "unknown"; success?: boolean; error?: string; protocolError?: { code?: string; stream?: string; limitBytes?: number; observedBytes?: number }; timedOut?: boolean; timeoutRecovery?: { changedFiles?: string[]; message?: string; warning?: string }; stopped?: boolean; turnBudget?: { maxTurns: number; graceTurns: number; outcome: string; turnCount: number; wrapUpRequestedAtTurn?: number; terminationDeferredAtTurn?: number; exceededAtTurn?: number }; turnBudgetExceeded?: boolean; wrapUpRequested?: boolean; model?: string; attemptedModels?: string[]; modelAttempts?: Array<{ success?: boolean; error?: string }>; totalCost?: { inputTokens: number; outputTokens: number; costUsd: number }; structuredOutput?: unknown; agentContract?: { version: 1 }; execution?: { status?: string; success?: boolean; exitCode?: number }; effects?: { fileMutation?: { status?: string; expected?: boolean; attempted?: boolean; message?: string }; settlementDiagnostic?: { finalTextPresent?: boolean; mutation?: { expected?: boolean; attempted?: boolean; observed?: boolean }; requiredOutput?: { kind?: string; path?: string; missing?: boolean }; afterCompactionSettlement?: boolean } }; intercomTarget?: string; acceptance?: { status?: string; effectiveAcceptance?: { level?: string }; childReport?: unknown; runtimeChecks?: Array<{ id?: string; status?: string; message?: string }> }; artifactPaths?: { outputPath?: string; inputPath?: string; metadataPath?: string; transcriptPath?: string }; outputSaveError?: string; metadataSaveError?: string; capabilityCeiling?: { version?: number; allowedTools?: string[]; denyExtensions?: boolean; sources?: string[] }; capabilityAudit?: { effectiveTools?: string[]; removedTools?: string[]; extensionsDenied?: boolean } }>;
+	results: Array<{ agent?: string; sessionName?: string; launchContractDigest?: string; launchResolvedExtensions?: LaunchResolvedExtensions; runtimeAcknowledgedExtensions?: RuntimeAcknowledgedExtensions; output?: string; outputState?: "present" | "absent" | "unknown"; success?: boolean; error?: string; protocolError?: { code?: string; stream?: string; limitBytes?: number; observedBytes?: number }; timedOut?: boolean; timeoutRecovery?: { changedFiles?: string[]; message?: string; warning?: string; recoveryNeeded?: boolean; reason?: string; reportStatus?: string }; stopped?: boolean; turnBudget?: { maxTurns: number; graceTurns: number; outcome: string; turnCount: number; wrapUpRequestedAtTurn?: number; terminationDeferredAtTurn?: number; exceededAtTurn?: number }; turnBudgetExceeded?: boolean; wrapUpRequested?: boolean; model?: string; attemptedModels?: string[]; modelAttempts?: Array<{ success?: boolean; error?: string }>; totalCost?: { inputTokens: number; outputTokens: number; costUsd: number }; usage?: { input: number; output: number; cacheRead: number; cacheWrite: number; cost: number; turns: number }; structuredOutput?: unknown; agentContract?: { version: 1 }; execution?: { status?: string; success?: boolean; exitCode?: number }; effects?: { fileMutation?: { status?: string; expected?: boolean; attempted?: boolean; message?: string }; settlementDiagnostic?: { finalTextPresent?: boolean; mutation?: { expected?: boolean; attempted?: boolean; observed?: boolean }; requiredOutput?: { kind?: string; path?: string; missing?: boolean }; afterCompactionSettlement?: boolean } }; intercomTarget?: string; acceptance?: { status?: string; effectiveAcceptance?: { level?: string }; childReport?: unknown; runtimeChecks?: Array<{ id?: string; status?: string; message?: string }> }; artifactPaths?: { outputPath?: string; inputPath?: string; metadataPath?: string; transcriptPath?: string }; outputSaveError?: string; metadataSaveError?: string; capabilityCeiling?: { version?: number; allowedTools?: string[]; denyExtensions?: boolean; sources?: string[] }; capabilityAudit?: { effectiveTools?: string[]; removedTools?: string[]; extensionsDenied?: boolean } }>;
 	outputs?: Record<string, { text?: string; structured?: unknown }>;
 	workflowGraph?: { nodes?: Array<{ kind?: string; label?: string; phase?: string; status?: string; acceptanceStatus?: string; error?: string; outputName?: string; structured?: boolean; children?: Array<{ label?: string; outputName?: string; itemKey?: string; status?: string; acceptanceStatus?: string; error?: string }> }> };
 	parallelHandoff?: { version?: number; path?: string; groupCount?: number; childCount?: number; changedPatches?: number; cleanupState?: string };
@@ -116,6 +117,8 @@ interface AsyncStatusPayload {
 	capabilityCeiling?: { version?: number; allowedTools?: string[]; denyExtensions?: boolean; sources?: string[] };
 	capabilityAudit?: { effectiveTools?: string[]; removedTools?: string[]; extensionsDenied?: boolean };
 	steps?: Array<{
+		agent?: string;
+		sessionName?: string;
 		label?: string;
 		phase?: string;
 		outputName?: string;
@@ -126,7 +129,7 @@ interface AsyncStatusPayload {
 		status?: string;
 		exitCode?: number;
 		timedOut?: boolean;
-		timeoutRecovery?: { changedFiles?: string[]; message?: string; warning?: string };
+		timeoutRecovery?: { changedFiles?: string[]; message?: string; warning?: string; recoveryNeeded?: boolean; reason?: string; reportStatus?: string };
 		error?: string;
 		model?: string;
 		thinking?: string;
@@ -365,24 +368,6 @@ async function waitForAsyncState(id: string, predicate: (status: AsyncStatusPayl
 	assert.fail(`Timed out waiting for async status: ${statusPath}`);
 }
 
-async function waitForDeferredTurnBudget(id: string, timeoutMs = 10_000): Promise<AsyncStatusPayload> {
-	const statusPath = path.join(ASYNC_DIR, id, "status.json");
-	const deadline = Date.now() + timeoutMs;
-	while (Date.now() <= deadline) {
-		if (fs.existsSync(statusPath)) {
-			const status = JSON.parse(fs.readFileSync(statusPath, "utf-8")) as AsyncStatusPayload;
-			if (status.state === "running"
-				&& status.turnBudget?.outcome === "termination-deferred"
-				&& status.steps?.[0]?.turnBudget?.outcome === "termination-deferred"
-				&& status.steps[0].currentTool === "bash") {
-				return status;
-			}
-		}
-		await new Promise((resolve) => setTimeout(resolve, 50));
-	}
-	assert.fail(`Timed out waiting for deferred turn-budget status: ${statusPath}`);
-}
-
 async function waitForMockPiCall(mockPi: MockPi, index: number, timeoutMs = 30_000): Promise<{ args: string[]; systemPrompts: NonNullable<MockPiCallRecord["systemPrompts"]> }> {
 	const deadline = Date.now() + timeoutMs;
 	for (;;) {
@@ -579,6 +564,31 @@ describe("async execution utilities", { skip: !available ? "pi packages not avai
 		assert.equal(status.endedAt !== undefined, true);
 	});
 
+	it("persists the bounded usage projection in async results and metadata", { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, async () => {
+		mockPi.onCall({ output: "accounted output" });
+		const id = `async-usage-artifact-${Date.now().toString(36)}`;
+		const artifactsDir = path.join(tempDir, ".pi", "subagents", "artifacts");
+		executeAsyncSingle(id, {
+			agent: "worker",
+			task: "Persist usage",
+			agentConfig: makeAgent("worker", { completionGuard: false }),
+			ctx: { pi: { events: { emit() {} } }, cwd: tempDir, currentSessionId: "session-usage-artifact" },
+			artifactConfig: { enabled: true, includeInput: false, includeOutput: true, includeJsonl: false, includeMetadata: true, cleanupDays: 7 },
+			artifactsDir,
+			shareEnabled: false,
+			maxSubagentDepth: 2,
+			acceptance: false,
+		});
+
+		const payload = await readAsyncPayload(id);
+		const expectedUsage = { input: 100, output: 50, cacheRead: 0, cacheWrite: 0, cost: 0.001, turns: 1 };
+		assert.deepEqual(payload.results[0]?.usage, expectedUsage);
+		const metadataPath = payload.results[0]?.artifactPaths?.metadataPath;
+		assert.ok(metadataPath);
+		const metadata = JSON.parse(fs.readFileSync(metadataPath, "utf-8")) as { usage?: unknown };
+		assert.deepEqual(metadata.usage, expectedUsage);
+	});
+
 	it("makes a launched async run immediately visible to exact status lookup", { skip: !isAsyncAvailable() || !resolveTargetedAsyncRun ? "jiti not available" : undefined }, async () => {
 		mockPi.onCall({ delay: 500, output: "visible async done" });
 		const id = `async-initial-status-${Date.now().toString(36)}`;
@@ -609,7 +619,7 @@ describe("async execution utilities", { skip: !available ? "pi packages not avai
 		await waitForAsyncResultFile(id);
 		const status = JSON.parse(fs.readFileSync(path.join(ASYNC_DIR, id, "status.json"), "utf-8")) as AsyncStatusPayload;
 		assert.equal(status.state, "failed");
-		assert.equal(status.error, "Step failed: worker");
+		assert.equal(status.error, "Detached for intercom coordination before task completion.");
 		assert.equal(status.steps?.[0]?.error, "Detached for intercom coordination before task completion.");
 	});
 
@@ -649,7 +659,6 @@ describe("async execution utilities", { skip: !available ? "pi packages not avai
 	it("matches preflight launch digest in equivalent foreground and async execution", { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, async () => {
 		const agentName = `contract-worker-${Date.now().toString(36)}`;
 		const task = "Compare the resolved launch inputs.";
-		const turnBudget = { maxTurns: 2, graceTurns: 1 } as const;
 		const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
 		const agentDir = path.join(tempDir, "agent-home");
 		process.env.PI_CODING_AGENT_DIR = agentDir;
@@ -663,12 +672,12 @@ describe("async execution utilities", { skip: !available ? "pi packages not avai
 		try {
 			const discovered = discoverAgents(tempDir).agents.find((agent) => agent.name === agentName);
 			assert.ok(discovered, "expected temporary agent definition to be discovered");
-			const preflight = await resolveSubagentLaunchContract({ agent: agentName, cwd: tempDir, task, turnBudget, runId: "contract-preflight" });
+			const preflight = await resolveSubagentLaunchContract({ agent: agentName, cwd: tempDir, task, runId: "contract-preflight" });
 			assert.equal(preflight.ok, true);
 			assert.ok(preflight.contract.tools.extensionArgs.some((entry) => entry.endsWith(path.join("pi-permission-system", "src", "index.ts"))));
 
 			mockPi.onCall({ output: "foreground contract comparison" });
-			const foreground = await runSync(tempDir, [discovered], agentName, task, { runId: "contract-foreground", acceptance: false, turnBudget });
+			const foreground = await runSync(tempDir, [discovered], agentName, task, { runId: "contract-foreground", acceptance: false });
 			assert.equal(foreground.exitCode, 0);
 			assert.equal(foreground.launchContractDigest, preflight.contract.launchContractDigest);
 
@@ -684,7 +693,6 @@ describe("async execution utilities", { skip: !available ? "pi packages not avai
 				sessionRoot: path.join(tempDir, "sessions"),
 				maxSubagentDepth: 2,
 				acceptance: false,
-				turnBudget,
 			});
 			const payload = await readAsyncPayload(asyncId);
 			assert.equal(launch.details.launchContractDigest, preflight.contract.launchContractDigest);
@@ -1544,14 +1552,15 @@ describe("async execution utilities", { skip: !available ? "pi packages not avai
 		assert.equal(payload.results[0]?.error, "Subagent timed out after 150ms.");
 	});
 
-	it("preserves async timeout recovery summaries in final results", { skip: !isAsyncAvailable() ? "jiti not available" : process.platform === "win32" ? "timeout signal delivery intermittent on Windows CI" : undefined }, async () => {
+	it("classifies a timed-out dirty child with a missing requested report as recovery-needed", { skip: !isAsyncAvailable() ? "jiti not available" : process.platform === "win32" ? "timeout signal delivery intermittent on Windows CI" : undefined }, async () => {
 		mockPi.onCall({ delay: 5_000, output: "too late" });
 		const repo = createRepo("pi-subagents-timeout-recovery-");
 		try {
 			const id = `async-timeout-recovery-${Date.now().toString(36)}`;
+			const outputPath = path.join(repo, "missing-report.md");
 			executeAsyncChain(id, {
-				chain: [{ agent: "slow", task: "Wait" }],
-				agents: [makeAgent("slow")],
+				chain: [{ agent: "slow", task: "Write the requested report" }],
+				agents: [makeAgent("slow", { output: outputPath, outputMode: "file-only" })],
 				ctx: { pi: { events: { emit() {} } }, cwd: repo, currentSessionId: "session-1" },
 				artifactConfig: {
 					enabled: true,
@@ -1571,12 +1580,27 @@ describe("async execution utilities", { skip: !available ? "pi packages not avai
 			const payload = await readAsyncPayload(id);
 			const status = await waitForAsyncState(id, (candidate) => candidate.state === "failed");
 			const result = payload.results[0];
+			const recovery = result?.timeoutRecovery;
+			const statusRecovery = status.steps?.[0]?.timeoutRecovery;
+			assert.equal(payload.success, false);
+			assert.equal(payload.state, "failed");
 			assert.equal(result?.timedOut, true);
+			assert.equal(result?.success, false);
+			assert.equal(fs.existsSync(outputPath), false);
 			assert.deepEqual(result?.timeoutRecovery?.changedFiles, ["input.md"]);
+			assert.equal(recovery?.recoveryNeeded, true);
+			assert.equal(recovery?.reason, "timed-out-with-dirty-worktree");
+			assert.equal(recovery?.reportStatus, "missing");
 			assert.match(result?.timeoutRecovery?.message ?? "", /changed tracked files: input\.md/);
+			assert.match(recovery?.message ?? "", /requested report: missing/i);
+			assert.match(result?.output ?? "", /review (?:the )?diff and artifacts before resuming.*dependent stages/i);
 			assert.match(result?.output ?? "", /Recovery summary:/);
 			assert.match(result?.output ?? "", /Warning: Inspect partial changes before retrying/);
-			assert.deepEqual(status.steps?.[0]?.timeoutRecovery?.changedFiles, ["input.md"]);
+			assert.equal(status.state, "failed");
+			assert.equal(status.steps?.[0]?.status, "failed");
+			assert.deepEqual(statusRecovery?.changedFiles, ["input.md"]);
+			assert.equal(statusRecovery?.recoveryNeeded, true);
+			assert.equal(statusRecovery?.reportStatus, "missing");
 		} finally {
 			fs.rmSync(repo, { recursive: true, force: true });
 		}
@@ -1928,224 +1952,6 @@ describe("async execution utilities", { skip: !available ? "pi packages not avai
 		assert.equal(metadata.acceptance?.status, "rejected");
 		assert.equal(metadata.acceptance?.runtimeChecks?.[0]?.id, "timeout");
 		assert.ok(elapsedMs < timeoutMs + 4_000, `timeout should cancel acceptance verification well before the verify command completes, elapsed ${elapsedMs}ms`);
-	});
-
-	it("async turn budget allows a terminal final grace turn", { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, async () => {
-		mockPi.onCall({
-			jsonl: [
-				mockAssistantMessage("working before wrap-up", "tool_use"),
-				mockAssistantMessage("final wrapped output", "stop"),
-			],
-		});
-		const id = `async-turn-budget-soft-${Date.now().toString(36)}`;
-		executeAsyncSingle(id, {
-			agent: "worker",
-			task: "Use the final grace turn to wrap up.",
-			agentConfig: makeAgent("worker"),
-			ctx: { pi: { events: { emit() {} } }, cwd: tempDir, currentSessionId: "session-1" },
-			artifactConfig: { enabled: false, includeInput: false, includeOutput: false, includeJsonl: false, includeMetadata: false, cleanupDays: 7 },
-			shareEnabled: false,
-			maxSubagentDepth: 2,
-			turnBudget: { maxTurns: 1, graceTurns: 1 },
-		});
-
-		const resultPath = await waitForAsyncResultFile(id, 10_000);
-		const payload = JSON.parse(fs.readFileSync(resultPath, "utf-8")) as AsyncResultPayload;
-		const status = await waitForAsyncState(id, (candidate) => candidate.state === "complete");
-		assert.equal(payload.success, true);
-		assert.equal(payload.state, "complete");
-		assert.equal(payload.turnBudgetExceeded, undefined);
-		assert.equal(payload.wrapUpRequested, true);
-		assert.equal(payload.turnBudget?.outcome, "wrap-up-requested");
-		assert.equal(payload.turnBudget?.turnCount, 2);
-		assert.equal(payload.results[0]?.wrapUpRequested, true);
-		assert.equal(payload.results[0]?.turnBudget?.turnCount, 2);
-		assert.match(payload.results[0]?.output ?? "", /Turn budget wrap-up was requested after 1 assistant turn/);
-		assert.match(payload.results[0]?.output ?? "", /final wrapped output/);
-		assert.equal(status.wrapUpRequested, true);
-		assert.equal(status.turnBudgetExceeded, undefined);
-		assert.equal(status.steps?.[0]?.wrapUpRequested, true);
-		assert.equal(status.steps?.[0]?.turnBudget?.turnCount, 2);
-	});
-
-	it("async turn budget preserves a clean terminal response beyond the final grace turn", { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, async () => {
-		mockPi.onCall({
-			jsonl: [
-				mockAssistantMessage("working before wrap-up", "tool_use"),
-				mockAssistantMessage("starting final grace tool work", "tool_use"),
-				mockAssistantMessage("safe assistant boundary after tool work", "stop"),
-			],
-		});
-		const id = `async-turn-budget-hard-${Date.now().toString(36)}`;
-		executeAsyncSingle(id, {
-			agent: "worker",
-			task: "Exceed the turn budget.",
-			agentConfig: makeAgent("worker"),
-			ctx: { pi: { events: { emit() {} } }, cwd: tempDir, currentSessionId: "session-1" },
-			artifactConfig: { enabled: false, includeInput: false, includeOutput: false, includeJsonl: false, includeMetadata: false, cleanupDays: 7 },
-			shareEnabled: false,
-			maxSubagentDepth: 2,
-			turnBudget: { maxTurns: 1, graceTurns: 1 },
-		});
-
-		const resultPath = await waitForAsyncResultFile(id, 10_000);
-		const payload = JSON.parse(fs.readFileSync(resultPath, "utf-8")) as AsyncResultPayload;
-		const status = await waitForAsyncState(id, (candidate) => candidate.state === "complete");
-		assert.equal(payload.success, true);
-		assert.equal(payload.state, "complete");
-		assert.equal(payload.exitCode, 0);
-		assert.equal(payload.turnBudgetExceeded, undefined);
-		assert.equal(payload.wrapUpRequested, true);
-		assert.equal(payload.turnBudget?.outcome, "wrap-up-requested");
-		assert.equal(payload.turnBudget?.turnCount, 3);
-		assert.equal(payload.results[0]?.turnBudgetExceeded, undefined);
-		assert.match(payload.results[0]?.output ?? "", /safe assistant boundary after tool work/);
-		assert.equal(status.state, "complete");
-		assert.equal(status.turnBudgetExceeded, undefined);
-		assert.equal(status.steps?.[0]?.turnBudgetExceeded, undefined);
-		assert.equal(status.steps?.[0]?.turnBudget?.outcome, "wrap-up-requested");
-	});
-
-	it("preserves an async clean completion after turn-budget work defers", { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, async () => {
-		const id = `async-turn-budget-deferred-${Date.now().toString(36)}`;
-		const releasePath = path.join(tempDir, `${id}.release`);
-		mockPi.onCall({
-			steps: [
-				{
-					jsonl: [
-						mockAssistantMessage("starting required tool work", "tool_use"),
-						events.toolStart("bash", { command: "node build.mjs" }),
-					],
-				},
-				{
-					waitForPath: releasePath,
-					jsonl: [
-						events.toolResult("bash", "build completed"),
-						events.toolEnd("bash"),
-						mockAssistantMessage("safe assistant boundary reached", "stop"),
-					],
-				},
-			],
-		});
-		executeAsyncSingle(id, {
-			agent: "worker",
-			task: "Finish active tool work before enforcing the hard limit.",
-			agentConfig: makeAgent("worker"),
-			ctx: { pi: { events: { emit() {} } }, cwd: tempDir, currentSessionId: "session-1" },
-			artifactConfig: { enabled: false, includeInput: false, includeOutput: false, includeJsonl: false, includeMetadata: false, cleanupDays: 7 },
-			shareEnabled: false,
-			maxSubagentDepth: 2,
-			turnBudget: { maxTurns: 1, graceTurns: 0 },
-		});
-
-		let pending: AsyncStatusPayload;
-		try {
-			pending = await waitForDeferredTurnBudget(id);
-		} finally {
-			fs.writeFileSync(releasePath, "release", "utf-8");
-		}
-		assert.equal(pending.error, undefined);
-		assert.equal(pending.turnBudgetExceeded, undefined);
-		assert.equal(pending.turnBudget?.terminationDeferredAtTurn, 1);
-		assert.equal(pending.steps?.[0]?.status, "running");
-		assert.equal(pending.steps?.[0]?.turnBudgetExceeded, undefined);
-
-		const resultPath = await waitForAsyncResultFile(id, 10_000);
-		const payload = JSON.parse(fs.readFileSync(resultPath, "utf-8")) as AsyncResultPayload;
-		const status = await waitForAsyncState(id, (candidate) => candidate.state === "complete");
-		assert.equal(payload.state, "complete");
-		assert.equal(payload.turnBudgetExceeded, undefined);
-		assert.equal(payload.turnBudget?.outcome, "wrap-up-requested");
-		assert.equal(payload.turnBudget?.turnCount, 2);
-		assert.equal(payload.results[0]?.turnBudgetExceeded, undefined);
-		assert.match(payload.results[0]?.output ?? "", /safe assistant boundary reached/);
-		assert.equal(status.state, "complete");
-		assert.equal(status.turnBudgetExceeded, undefined);
-		assert.equal(status.steps?.[0]?.turnBudget?.outcome, "wrap-up-requested");
-	});
-
-	it("lets timeout delivery preempt deferred turn-budget termination", { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, async () => {
-		mockPi.onCall({
-			steps: [
-				{
-					jsonl: [
-						mockAssistantMessage("starting long tool work", "tool_use"),
-						events.toolStart("bash", { command: "node build.mjs" }),
-					],
-				},
-				{ delay: 5_000, jsonl: [events.toolEnd("bash")] },
-			],
-		});
-		const id = `async-turn-budget-timeout-${Date.now().toString(36)}`;
-		executeAsyncSingle(id, {
-			agent: "worker",
-			task: "Timeout while hard termination is deferred.",
-			agentConfig: makeAgent("worker"),
-			ctx: { pi: { events: { emit() {} } }, cwd: tempDir, currentSessionId: "session-1" },
-			artifactConfig: { enabled: false, includeInput: false, includeOutput: false, includeJsonl: false, includeMetadata: false, cleanupDays: 7 },
-			shareEnabled: false,
-			maxSubagentDepth: 2,
-			turnBudget: { maxTurns: 1, graceTurns: 0 },
-			timeoutMs: 30_000,
-		});
-
-		const pending = await waitForDeferredTurnBudget(id);
-		const asyncDir = path.join(ASYNC_DIR, id);
-		deliverTimeoutRequest({ asyncDir, pid: pending.pid, source: "test" });
-		const resultPath = await waitForAsyncResultFile(id, 10_000);
-		const payload = JSON.parse(fs.readFileSync(resultPath, "utf-8")) as AsyncResultPayload;
-		const status = await waitForAsyncState(id, (candidate) => candidate.state === "failed");
-		assert.equal(payload.state, "failed");
-		assert.equal(payload.timedOut, true);
-		assert.equal(payload.turnBudgetExceeded, undefined);
-		assert.match(payload.error ?? payload.summary ?? "", /timed out after 30000ms/);
-		assert.equal(payload.results[0]?.timedOut, true);
-		assert.equal(payload.results[0]?.turnBudgetExceeded, undefined);
-		assert.equal(status.timedOut, true);
-		assert.equal(status.turnBudgetExceeded, undefined);
-		assert.equal(status.steps?.[0]?.timedOut, true);
-	});
-
-	it("lets explicit stop preempt deferred turn-budget termination", { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, async () => {
-		mockPi.onCall({
-			steps: [
-				{
-					jsonl: [
-						mockAssistantMessage("starting long tool work", "tool_use"),
-						events.toolStart("bash", { command: "node build.mjs" }),
-					],
-				},
-				{ delay: 5_000, jsonl: [events.toolEnd("bash")] },
-			],
-		});
-		const id = `async-turn-budget-stop-${Date.now().toString(36)}`;
-		executeAsyncSingle(id, {
-			agent: "worker",
-			task: "Stop while hard termination is deferred.",
-			agentConfig: makeAgent("worker"),
-			ctx: { pi: { events: { emit() {} } }, cwd: tempDir, currentSessionId: "session-1" },
-			artifactConfig: { enabled: false, includeInput: false, includeOutput: false, includeJsonl: false, includeMetadata: false, cleanupDays: 7 },
-			shareEnabled: false,
-			maxSubagentDepth: 2,
-			turnBudget: { maxTurns: 1, graceTurns: 0 },
-		});
-
-		const pending = await waitForDeferredTurnBudget(id);
-		const asyncDir = path.join(ASYNC_DIR, id);
-		deliverStopRequest({ asyncDir, pid: pending.pid, source: "test" });
-		const resultPath = await waitForAsyncResultFile(id, 10_000);
-		const payload = JSON.parse(fs.readFileSync(resultPath, "utf-8")) as AsyncResultPayload;
-		const status = await waitForAsyncState(id, (candidate) => candidate.state === "stopped");
-		assert.equal(payload.state, "stopped");
-		assert.equal(payload.stopped, true);
-		assert.equal(payload.turnBudgetExceeded, undefined);
-		assert.match(payload.error ?? payload.summary ?? "", /stopped by user/i);
-		assert.equal(payload.results[0]?.stopped, true);
-		assert.equal(payload.results[0]?.turnBudgetExceeded, undefined);
-		assert.equal(status.state, "stopped");
-		assert.equal(status.stopped, true);
-		assert.equal(status.turnBudgetExceeded, undefined);
-		assert.equal(status.steps?.[0]?.status, "stopped");
 	});
 
 	it("async launch messages tell the parent not to sleep-poll", { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, async () => {
@@ -2625,7 +2431,6 @@ describe("async execution utilities", { skip: !available ? "pi packages not avai
 					parallel: {
 						agent: "reviewer",
 						task: "Review {target.path}",
-						label: "Review {target.path}",
 						outputSchema: { type: "object" },
 				},
 				collect: { as: "reviews" },
@@ -2650,6 +2455,8 @@ describe("async execution utilities", { skip: !available ? "pi packages not avai
 		assert.match(readMockPiArgs(mockPi, 1).at(-1) ?? "", /Review src\/a\.ts/);
 		assert.match(readMockPiArgs(mockPi, 2).at(-1) ?? "", /Review src\/b\.ts/);
 		assert.match(readMockPiArgs(mockPi, 3).at(-1) ?? "", /"key":"src\/a\.ts"/);
+		assert.deepEqual(status.steps?.slice(1, 3).map((step) => step.sessionName), ["reviewer: Review src/a.ts", "reviewer: Review src/b.ts"]);
+		assert.deepEqual(payload.results.slice(1, 3).map((result) => result.sessionName), ["reviewer: Review src/a.ts", "reviewer: Review src/b.ts"]);
 		const collected = payload.outputs?.reviews?.structured as Array<{ key: string; structured: unknown }>;
 		assert.deepEqual(collected.map((item) => item.key), ["src/a.ts", "src/b.ts"]);
 		assert.deepEqual(collected.map((item) => item.structured), [{ ok: "a" }, { ok: "b" }]);
@@ -3093,7 +2900,6 @@ describe("async execution utilities", { skip: !available ? "pi packages not avai
 			agent: "worker",
 			task: "Do work",
 			acceptance: { level: "none", reason: "descriptor persistence coverage" },
-			turnBudget: { maxTurns: 8, graceTurns: 2 },
 			agentConfig: makeAgent("worker", {
 				model: "openai/gpt-5-mini:high",
 				fallbackModels: ["anthropic/claude-sonnet-4:low"],
@@ -3135,7 +2941,7 @@ describe("async execution utilities", { skip: !available ? "pi packages not avai
 		assert.equal(descriptor.cwd, tempDir);
 		assert.equal(descriptor.sessionDir, path.join(sessionRoot, `async-${id}`));
 		assert.deepEqual(descriptor.acceptance, { level: "none", reason: "descriptor persistence coverage" });
-		assert.deepEqual(descriptor.initialTurnBudget, { maxTurns: 8, graceTurns: 2 });
+		assert.equal(descriptor.initialTurnBudget, undefined);
 		assert.equal(Object.hasOwn(descriptor.acceptance, "explicit"), false);
 		assert.equal(Object.hasOwn(descriptor.acceptance, "inferredReason"), false);
 		assert.equal(Object.hasOwn(descriptor, "task"), false);
@@ -3437,28 +3243,92 @@ describe("async execution utilities", { skip: !available ? "pi packages not avai
 		assert.equal(mockPi.callCount(), 1);
 	});
 
-	it("background runs do not retry provider connection errors after completed tool work", { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, async () => {
+	it("background runs resume the retained session once after a compaction-induced abort following completed tool work", { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, async () => {
+		const sessionFile = path.join(tempDir, "async-abort-recovery-session.jsonl");
 		mockPi.onCall({
 			jsonl: [
 				events.toolStart("write", { path: "side-effect.txt", content: "done" }),
 				events.toolEnd("write"),
 				events.toolResult("write", "Wrote side-effect.txt"),
+				{ type: "compaction_start" },
 				{
 					type: "message_end",
 					message: {
 						role: "assistant",
 						content: [],
 						model: "openai/gpt-5-mini",
-						errorMessage: "Connection error.",
-						usage: { input: 10, output: 0, cacheRead: 0, cacheWrite: 0, cost: { total: 0.001 } },
+						stopReason: "aborted",
+						usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: { total: 0 } },
 					},
 				},
+				{ type: "agent_settled" },
 			],
-			writeFiles: [{ path: "side-effect.txt", content: "done" }],
-			exitCode: 1,
+			writeFiles: [{ path: "side-effect.txt", content: "done" }, { path: sessionFile, content: "{}\n" }],
+			keepAliveAfterFinalMessageMs: 5_000,
+			exitCode: 0,
 		});
-		mockPi.onCall({ output: "fallback must not run" });
+		mockPi.onCall({ output: "Recovered asynchronously from retained session" });
 		const id = `async-fallback-provider-after-tool-${Date.now().toString(36)}`;
+		executeAsyncSingle(id, {
+			agent: "worker",
+			task: "Do work",
+			sessionFile,
+			agentConfig: makeAgent("worker", {
+				model: "openai/gpt-5-mini:high",
+				fallbackModels: ["anthropic/claude-sonnet-4:low"],
+			}),
+			ctx: { pi: { events: { emit() {} } }, cwd: tempDir, currentSessionId: "session-1" },
+			availableModels: [
+				{ provider: "openai", id: "gpt-5-mini", fullId: "openai/gpt-5-mini" },
+				{ provider: "anthropic", id: "claude-sonnet-4", fullId: "anthropic/claude-sonnet-4" },
+			],
+			artifactConfig: {
+				enabled: false,
+				includeInput: false,
+				includeOutput: false,
+				includeJsonl: false,
+				includeMetadata: false,
+				cleanupDays: 7,
+			},
+			shareEnabled: false,
+			maxSubagentDepth: 2,
+		});
+
+		const payload = JSON.parse(fs.readFileSync(await waitForAsyncResultFile(id), "utf-8"));
+		assert.equal(payload.success, true);
+		assert.deepEqual(payload.results[0].attemptedModels, ["openai/gpt-5-mini:high"]);
+		assert.deepEqual(payload.results[0].modelAttempts.map((attempt: { success: boolean }) => attempt.success), [false, true]);
+		assert.equal(mockPi.callCount(), 2);
+		const firstArgs = readMockPiArgs(mockPi, 0);
+		const resumedArgs = readMockPiArgs(mockPi, 1);
+		assert.equal(firstArgs[firstArgs.indexOf("--session") + 1], sessionFile);
+		assert.equal(resumedArgs[resumedArgs.indexOf("--session") + 1], sessionFile);
+		assert.match(resumedArgs.at(-1) ?? "", /Continue from the current files and transcript/);
+		assert.equal(fs.readFileSync(path.join(tempDir, "side-effect.txt"), "utf-8"), "done");
+	});
+
+	it("background compaction abort without a retained session does not fall back", { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, async () => {
+		mockPi.onCall({
+			jsonl: [
+				events.assistantMessage("I inspected the source."),
+				{ type: "compaction_start" },
+				{
+					type: "message_end",
+					message: {
+						role: "assistant",
+						content: [],
+						model: "openai/gpt-5-mini",
+						stopReason: "aborted",
+						usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: { total: 0 } },
+					},
+				},
+				{ type: "agent_settled" },
+			],
+			keepAliveAfterFinalMessageMs: 5_000,
+			exitCode: 0,
+		});
+		mockPi.onCall({ output: "Fallback must not run" });
+		const id = `async-compaction-abort-no-session-${Date.now().toString(36)}`;
 		executeAsyncSingle(id, {
 			agent: "worker",
 			task: "Do work",
@@ -3485,10 +3355,112 @@ describe("async execution utilities", { skip: !available ? "pi packages not avai
 
 		const payload = JSON.parse(fs.readFileSync(await waitForAsyncResultFile(id), "utf-8"));
 		assert.equal(payload.success, false);
-		assert.equal(payload.results[0].modelAttempts.length, 1);
-		assert.match(payload.results[0].error ?? "", /Connection error/u);
+		assert.match(payload.results[0]?.error ?? "", /Compaction-induced child abort could not be resumed safely: retained session unavailable\./);
+		assert.doesNotMatch(payload.results[0]?.output ?? "", /Fallback must not run/);
 		assert.equal(mockPi.callCount(), 1);
-		assert.equal(fs.readFileSync(path.join(tempDir, "side-effect.txt"), "utf-8"), "done");
+	});
+
+	it("background does not use compaction recovery for a generic empty assistant abort after a compaction retry", { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, async () => {
+		const sessionFile = path.join(tempDir, "async-generic-empty-after-compaction-retry-session.jsonl");
+		mockPi.onCall({
+			jsonl: [
+				{ type: "compaction_start" },
+				{ type: "compaction_end", willRetry: true },
+				{ type: "agent_settled" },
+				{ type: "agent_start" },
+				events.assistantMessage("The compaction retry produced useful output.", "openai/gpt-5-mini"),
+				{ type: "agent_settled" },
+				{
+					type: "message_end",
+					message: {
+						role: "assistant",
+						content: [],
+						model: "openai/gpt-5-mini",
+						stopReason: "aborted",
+						usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: { total: 0 } },
+					},
+				},
+				{ type: "agent_settled" },
+			],
+			writeFiles: [{ path: sessionFile, content: "{}\n" }],
+			exitCode: 0,
+		});
+		mockPi.onCall({ output: "Compaction recovery must not run" });
+		const id = `async-no-compaction-recovery-after-retry-${Date.now().toString(36)}`;
+		executeAsyncSingle(id, {
+			agent: "worker",
+			task: "Do work",
+			sessionFile,
+			agentConfig: makeAgent("worker", { model: "openai/gpt-5-mini" }),
+			ctx: { pi: { events: { emit() {} } }, cwd: tempDir, currentSessionId: "session-1" },
+			availableModels: [{ provider: "openai", id: "gpt-5-mini", fullId: "openai/gpt-5-mini" }],
+			artifactConfig: {
+				enabled: false,
+				includeInput: false,
+				includeOutput: false,
+				includeJsonl: false,
+				includeMetadata: false,
+				cleanupDays: 7,
+			},
+			shareEnabled: false,
+			maxSubagentDepth: 2,
+		});
+
+		const payload = JSON.parse(fs.readFileSync(await waitForAsyncResultFile(id), "utf-8"));
+		assert.equal(payload.success, false);
+		assert.match(payload.results[0]?.error ?? "", /Subagent produced no output after terminal assistant stopReason "aborted"\./u);
+		assert.equal(payload.results[0]?.modelAttempts?.length, 1);
+		assert.equal(mockPi.callCount(), 1);
+	});
+
+	it("background does not use compaction recovery after compaction_end willRetry false and a continued agent turn", { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, async () => {
+		const sessionFile = path.join(tempDir, "async-generic-empty-after-successful-compaction-session.jsonl");
+		mockPi.onCall({
+			jsonl: [
+				{ type: "compaction_start" },
+				{ type: "compaction_end", willRetry: false },
+				{ type: "agent_start" },
+				{
+					type: "message_end",
+					message: {
+						role: "assistant",
+						content: [],
+						model: "openai/gpt-5-mini",
+						stopReason: "aborted",
+						usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: { total: 0 } },
+					},
+				},
+				{ type: "agent_settled" },
+			],
+			writeFiles: [{ path: sessionFile, content: "{}\n" }],
+			exitCode: 0,
+		});
+		mockPi.onCall({ output: "Compaction recovery must not run" });
+		const id = `async-no-compaction-recovery-after-successful-compaction-${Date.now().toString(36)}`;
+		executeAsyncSingle(id, {
+			agent: "worker",
+			task: "Do work",
+			sessionFile,
+			agentConfig: makeAgent("worker", { model: "openai/gpt-5-mini" }),
+			ctx: { pi: { events: { emit() {} } }, cwd: tempDir, currentSessionId: "session-1" },
+			availableModels: [{ provider: "openai", id: "gpt-5-mini", fullId: "openai/gpt-5-mini" }],
+			artifactConfig: {
+				enabled: false,
+				includeInput: false,
+				includeOutput: false,
+				includeJsonl: false,
+				includeMetadata: false,
+				cleanupDays: 7,
+			},
+			shareEnabled: false,
+			maxSubagentDepth: 2,
+		});
+
+		const payload = JSON.parse(fs.readFileSync(await waitForAsyncResultFile(id), "utf-8"));
+		assert.equal(payload.success, false);
+		assert.match(payload.results[0]?.error ?? "", /Subagent produced no output after terminal assistant stopReason "aborted"\./u);
+		assert.equal(payload.results[0]?.modelAttempts?.length, 1);
+		assert.equal(mockPi.callCount(), 1);
 	});
 
 	it("background single thinking override replaces primary and fallback suffixes", { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, async () => {
@@ -4697,6 +4669,38 @@ describe("async execution utilities", { skip: !available ? "pi packages not avai
 		assert.equal(payload.results[0]?.model, "gateway/parent-model");
 	});
 
+	it("background forked runs receive the derived fork cache key", { skip: !isAsyncAvailable() || !createSubagentExecutor ? "jiti or executor not available" : undefined }, async () => {
+		mockPi.onCall({ echoEnv: [SUBAGENT_FORK_CACHE_KEY_ENV] });
+		const parentSessionFile = path.join(tempDir, "parent-cache.jsonl");
+		const forkedSessionFile = path.join(tempDir, "forked-cache.jsonl");
+		const sessionHeader = JSON.stringify({ type: "session", cwd: fs.realpathSync(tempDir) });
+		fs.writeFileSync(parentSessionFile, `${sessionHeader}\n`, "utf-8");
+		fs.writeFileSync(forkedSessionFile, `${sessionHeader}\n`, "utf-8");
+		const ctx = {
+			...makeMinimalCtx(tempDir),
+			sessionManager: {
+				getSessionId: () => "session-cache-parent",
+				getSessionFile: () => parentSessionFile,
+				getLeafId: () => "leaf-current",
+				openSession: () => ({ createBranchedSession: () => forkedSessionFile }),
+			},
+		};
+
+		const launch = await makeAsyncExecutor([makeAgent("worker", { completionGuard: false })]).execute(
+			"forked-cache-key",
+			{ agent: "worker", task: "Inspect cache affinity", async: true, context: "fork" },
+			new AbortController().signal,
+			undefined,
+			ctx,
+		) as AsyncExecutionResult;
+		assert.ok(!launch.isError, launch.content[0]?.text);
+		assert.ok(launch.details.asyncId);
+
+		const payload = await readAsyncPayload(launch.details.asyncId);
+		const childEnv = JSON.parse(payload.results[0]?.output ?? "{}") as Record<string, string | null>;
+		assert.equal(childEnv[SUBAGENT_FORK_CACHE_KEY_ENV], deriveForkPromptCacheKey("session-cache-parent"));
+	});
+
 	it("revives an inherited parent model outside the current registry", { skip: !isAsyncAvailable() || !createSubagentExecutor ? "jiti or executor not available" : undefined }, async () => {
 		mockPi.onCall({ output: "Initial async work" });
 		const sourceId = `async-revive-parent-model-${Date.now().toString(36)}`;
@@ -5596,10 +5600,194 @@ describe("async execution utilities", { skip: !available ? "pi packages not avai
 		assert.equal(payload.results[0].error, "provider exploded");
 	});
 
-	it("reports bounded compaction failure context when file-only output is missing", { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, async () => {
-		const terminalError = `This operation was aborted${"x".repeat(12_000)}`;
+	it("reports terminal abort before a missing file-only handoff after mutation", { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, async () => {
+		const partialOutput = "I’ll inspect the retained candidate before changing it.";
+		const repo = createRepo("pi-subagents-missing-handoff-partial-");
+		const outputPath = path.join(repo, "missing-challenge-report.md");
 		mockPi.onCall({
 			jsonl: [
+				events.assistantMessage(partialOutput),
+				{
+					type: "message_end",
+					message: {
+						role: "assistant",
+						content: [],
+						model: "mock/test-model",
+						stopReason: "aborted",
+						usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: { total: 0 } },
+					},
+				},
+			],
+			writeFiles: [{ path: "input.md", content: "changed by retained child\n" }],
+		});
+
+		const task = [
+			"You are reviving a previous subagent conversation.",
+			"",
+			"Original run: source-run",
+			"Original agent: worker",
+			"Original session file: /tmp/source-session.jsonl",
+			"",
+			"Use the stored session context as background. Answer the orchestrator's follow-up below. Do not assume the original child process is still alive.",
+			"",
+			"Follow-up:",
+			"Implementation challenge pass 1 for the accepted candidate. Reconsider it and implement any better current-scope change.",
+		].join("\n");
+		const id = `async-missing-handoff-guard-${Date.now().toString(36)}`;
+		try {
+			executeAsyncSingle(id, {
+				agent: "worker",
+				task,
+				agentConfig: makeAgent("worker"),
+				ctx: { pi: { events: { emit() {} } }, cwd: repo, currentSessionId: "session-1" },
+				artifactConfig: { enabled: false, includeInput: false, includeOutput: false, includeJsonl: false, includeMetadata: false, cleanupDays: 7 },
+				shareEnabled: false,
+				sessionRoot: path.join(tempDir, "sessions"),
+				output: outputPath,
+				outputMode: "file-only",
+				maxSubagentDepth: 2,
+			});
+
+			const resultPath = await waitForAsyncResultFile(id);
+			const payload = JSON.parse(fs.readFileSync(resultPath, "utf-8")) as AsyncResultPayload;
+			const child = payload.results[0];
+			const diagnostic = child?.error ?? "";
+			assert.equal(payload.success, false);
+			assert.equal(payload.state, "partial");
+			assert.equal(child?.success, false);
+			assert.match(diagnostic, /^Subagent produced no output after terminal assistant stopReason "aborted"\./);
+			assert.match(diagnostic, new RegExp(`Required file-only output was not produced: ${escapeRegExp(outputPath)}`));
+			assert.doesNotMatch(diagnostic, /completed without making edits/);
+			assert.doesNotMatch(child?.modelAttempts?.[0]?.error ?? "", /completed without making edits/);
+			assert.equal(child?.effects?.fileMutation?.status, "observed");
+			assert.equal(child?.effects?.fileMutation?.attempted, true);
+			assert.deepEqual(child?.effects?.fileMutation?.evidence?.changedFiles, ["input.md"]);
+			assert.equal(child?.effects?.settlementDiagnostic?.requiredOutput?.missing, true);
+			assert.equal(fs.existsSync(outputPath), false);
+
+			const status = await waitForAsyncState(id, (candidate) => candidate.state === "partial");
+			assert.equal(status.activityState, "needs_attention");
+			assert.equal(status.steps?.[0]?.activityState, "needs_attention");
+			assert.equal(status.steps?.[0]?.error, diagnostic);
+			const eventsText = fs.readFileSync(path.join(ASYNC_DIR, id, "events.jsonl"), "utf-8");
+			assert.doesNotMatch(eventsText, /completed without making edits/);
+		} finally {
+			removeTempDir(repo);
+		}
+	});
+
+	it("preserves terminal empty-output diagnostics after useful child work", { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, async () => {
+		const partialOutput = "I’ll inspect the retained candidate before changing it.";
+		const outputPath = path.join(tempDir, "missing-aborted-report.md");
+		mockPi.onCall({
+			jsonl: [
+				events.toolStart("read", { path: "src/index.ts" }),
+				events.toolEnd("read"),
+				events.toolResult("read", "file contents"),
+				events.assistantMessage(partialOutput),
+				{
+					type: "message_end",
+					message: {
+						role: "assistant",
+						content: [],
+						model: "mock/test-model",
+						stopReason: "aborted",
+						usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: { total: 0 } },
+					},
+				},
+			],
+			exitCode: 0,
+		});
+
+		const id = `async-aborted-empty-handoff-${Date.now().toString(36)}`;
+		executeAsyncSingle(id, {
+			agent: "worker",
+			task: "Implement the approved file changes",
+			agentConfig: makeAgent("worker"),
+			ctx: { pi: { events: { emit() {} } }, cwd: tempDir, currentSessionId: "session-1" },
+			artifactConfig: { enabled: false, includeInput: false, includeOutput: false, includeJsonl: false, includeMetadata: false, cleanupDays: 7 },
+			shareEnabled: false,
+			sessionRoot: path.join(tempDir, "sessions"),
+			output: outputPath,
+			outputMode: "file-only",
+			maxSubagentDepth: 2,
+		});
+
+		const resultPath = await waitForAsyncResultFile(id);
+		const payload = JSON.parse(fs.readFileSync(resultPath, "utf-8")) as AsyncResultPayload;
+		const child = payload.results[0];
+		const diagnostic = child?.error ?? "";
+		assert.equal(payload.success, false);
+		assert.equal(child?.success, false);
+		assert.match(diagnostic, /^Subagent produced no output after terminal assistant stopReason "aborted"\./);
+		assert.match(diagnostic, /Required file-only output was not produced/);
+		assert.doesNotMatch(diagnostic, /completed without making edits/);
+		assert.doesNotMatch(child?.modelAttempts?.[0]?.error ?? "", /completed without making edits/);
+		assert.equal(child?.effects?.settlementDiagnostic?.requiredOutput?.missing, true);
+		assert.equal(child?.effects?.settlementDiagnostic?.finalTextPresent, true);
+		assert.equal(fs.existsSync(outputPath), false);
+
+		const eventsText = fs.readFileSync(path.join(ASYNC_DIR, id, "events.jsonl"), "utf-8");
+		assert.doesNotMatch(eventsText, /completed without making edits/);
+	});
+
+	it("reports zero-exit terminal stderr before missing file-only output after settlement", { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, async () => {
+		const outputPath = path.join(tempDir, "missing-stderr-report.md");
+		const terminalStderr = "Extension error: stale ctx after session replacement";
+		mockPi.onCall({
+			jsonl: [
+				events.toolStart("read", { path: "src/index.ts" }),
+				events.toolEnd("read"),
+				events.toolResult("read", "file contents"),
+				events.assistantMessage("I found the candidate seam."),
+				{
+					type: "message_end",
+					message: {
+						role: "assistant",
+						content: [],
+						model: "mock/test-model",
+						stopReason: "aborted",
+						usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: { total: 0 } },
+					},
+				},
+				{ type: "agent_settled" },
+			],
+			stderr: terminalStderr,
+		});
+
+		const id = `async-stderr-empty-handoff-${Date.now().toString(36)}`;
+		executeAsyncSingle(id, {
+			agent: "worker",
+			task: "Implement the approved file changes",
+			agentConfig: makeAgent("worker"),
+			ctx: { pi: { events: { emit() {} } }, cwd: tempDir, currentSessionId: "session-1" },
+			artifactConfig: { enabled: false, includeInput: false, includeOutput: false, includeJsonl: false, includeMetadata: false, cleanupDays: 7 },
+			shareEnabled: false,
+			sessionRoot: path.join(tempDir, "sessions"),
+			output: outputPath,
+			outputMode: "file-only",
+			maxSubagentDepth: 2,
+		});
+
+		const resultPath = await waitForAsyncResultFile(id);
+		const payload = JSON.parse(fs.readFileSync(resultPath, "utf-8")) as AsyncResultPayload;
+		const child = payload.results[0];
+		const diagnostic = child?.error ?? "";
+		assert.equal(payload.success, false);
+		assert.equal(child?.success, false);
+		assert.match(diagnostic, new RegExp(`^${escapeRegExp(terminalStderr)}`));
+		assert.match(diagnostic, /Required file-only output was not produced/);
+		assert.doesNotMatch(diagnostic, /^Subagent produced no output \(possible model cold-start or empty response\)\./);
+		assert.equal(fs.existsSync(outputPath), false);
+	});
+
+	it("reports bounded compaction failure context when file-only output is missing", { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, async () => {
+		const terminalError = `This operation was aborted\n${"x".repeat(12_000)}`;
+		mockPi.onCall({
+			jsonl: [
+				events.toolStart("read", { path: "src/index.ts" }),
+				events.toolEnd("read"),
+				events.toolResult("read", "file contents"),
 				{ type: "compaction_start" },
 				{
 					type: "message_end",
@@ -5640,6 +5828,7 @@ describe("async execution utilities", { skip: !available ? "pi packages not avai
 		assert.equal(payload.success, false);
 		assert.equal(child?.success, false);
 		assert.match(diagnostic, /^This operation was aborted/);
+		assert.match(diagnostic, /Compaction-induced child abort could not be resumed safely: retained session unavailable\./);
 		assert.match(diagnostic, /failure followed session compaction and agent settlement/);
 		assert.match(diagnostic, /Required file-only output was not produced/);
 		assert.ok(diagnostic.length <= 8_192);
@@ -5658,6 +5847,103 @@ describe("async execution utilities", { skip: !available ? "pi packages not avai
 			await new Promise((resolve) => setTimeout(resolve, 50));
 		}
 		assert.ok(fs.readFileSync(logPath, "utf-8").includes(`## Summary\noracle:\n${diagnostic}`));
+	});
+
+	it("preserves partial imported async roots with mutation evidence", { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, async () => {
+		const sourceId = `partial-source-${Date.now().toString(36)}`;
+		const sourceDir = path.join(ASYNC_DIR, sourceId);
+		const message = "Required file-only output was not produced: report.md";
+		const effects = { fileMutation: { status: "observed", expected: true, attempted: true, evidence: { source: "tracked-files", trackedOnly: true, cwd: tempDir, changedFiles: ["input.md"], attemptedMutation: true } } };
+		fs.mkdirSync(sourceDir, { recursive: true });
+		fs.writeFileSync(path.join(sourceDir, "status.json"), JSON.stringify({
+			runId: sourceId,
+			mode: "single",
+			state: "partial",
+			activityState: "needs_attention",
+			startedAt: Date.now(),
+			error: message,
+			steps: [{ agent: "worker", status: "failed", activityState: "needs_attention", error: message, effects }],
+		}), "utf-8");
+
+		const id = `async-imported-partial-${Date.now().toString(36)}`;
+		executeAsyncChain(id, {
+			chain: [],
+			attachRoot: { runId: sourceId, asyncDir: sourceDir, resultPath: path.join(RESULTS_DIR, `${sourceId}.json`), index: 0, agent: "worker" },
+			agents: [makeAgent("worker")],
+			ctx: { pi: { events: { emit() {} } }, cwd: tempDir, currentSessionId: "session-1" },
+			artifactConfig: { enabled: false, includeInput: false, includeOutput: false, includeJsonl: false, includeMetadata: false, cleanupDays: 7 },
+			shareEnabled: false,
+			sessionRoot: path.join(tempDir, "sessions"),
+			maxSubagentDepth: 2,
+		});
+
+		const resultPath = await waitForAsyncResultFile(id);
+		const payload = JSON.parse(fs.readFileSync(resultPath, "utf-8")) as AsyncResultPayload;
+		assert.equal(payload.success, false);
+		assert.equal(payload.state, "partial");
+		assert.equal(payload.summary, message);
+		assert.equal(payload.results[0]?.execution?.status, "partial");
+		assert.deepEqual(payload.results[0]?.effects?.fileMutation?.evidence?.changedFiles, ["input.md"]);
+
+		const status = await waitForAsyncState(id, (candidate) => candidate.state === "partial");
+		assert.equal(status.activityState, "needs_attention");
+		assert.equal(status.steps?.[0]?.activityState, "needs_attention");
+	});
+
+	it("keeps concrete sibling failures above partial mutation evidence", { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, async () => {
+		const repo = createRepo("pi-subagents-partial-sibling-failure-");
+		const outputPath = path.join(repo, "missing-report.md");
+		mockPi.onCall({
+			matchArgIncludes: "Write required report",
+			jsonl: [
+				events.assistantMessage("I changed the file but did not hand off the report."),
+				{
+					type: "message_end",
+					message: {
+						role: "assistant",
+						content: [],
+						model: "mock/test-model",
+						stopReason: "aborted",
+						usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: { total: 0 } },
+					},
+				},
+			],
+			writeFiles: [{ path: "input.md", content: "changed before missing report\n" }],
+		});
+		mockPi.onCall({ matchArgIncludes: "Fail normally", stderr: "ordinary sibling failure", exitCode: 1 });
+
+		const id = `async-partial-sibling-failure-${Date.now().toString(36)}`;
+		try {
+			executeAsyncChain(id, {
+				chain: [{
+					parallel: [
+						{ agent: "partial", task: "Write required report" },
+						{ agent: "failure", task: "Fail normally" },
+					],
+					concurrency: 2,
+				}],
+				resultMode: "parallel",
+				agents: [makeAgent("partial", { output: outputPath, outputMode: "file-only" }), makeAgent("failure", { completionGuard: false })],
+				ctx: { pi: { events: { emit() {} } }, cwd: repo, currentSessionId: "session-1" },
+				artifactConfig: { enabled: false, includeInput: false, includeOutput: false, includeJsonl: false, includeMetadata: false, cleanupDays: 7 },
+				shareEnabled: false,
+				maxSubagentDepth: 2,
+			});
+
+			const payload = await readAsyncPayload(id);
+			assert.equal(payload.success, false);
+			assert.equal(payload.state, "failed");
+			assert.match(payload.summary, /ordinary sibling failure/);
+			assert.equal(payload.results[0]?.effects?.fileMutation?.status, "observed");
+			assert.equal(payload.results[0]?.effects?.settlementDiagnostic?.requiredOutput?.missing, true);
+			assert.match(payload.results[1]?.error ?? "", /ordinary sibling failure/);
+
+			const status = await waitForAsyncState(id, (candidate) => candidate.state === "failed");
+			assert.equal(status.activityState, undefined);
+			assert.match(status.error ?? "", /ordinary sibling failure/);
+		} finally {
+			removeTempDir(repo);
+		}
 	});
 
 	it("reports missing file-only output when a child exits without an error", { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, async () => {
@@ -5684,7 +5970,7 @@ describe("async execution utilities", { skip: !available ? "pi packages not avai
 		assert.equal(payload.success, false);
 		assert.equal(payload.exitCode, 1);
 		assert.equal(child?.success, false);
-		assert.match(diagnostic, /^Subagent failed\.\nRequired file-only output was not produced:/);
+		assert.match(diagnostic, /^Required file-only output was not produced:/);
 		assert.equal(fs.existsSync(outputPath), false);
 		assert.equal(child?.output, "");
 		assert.equal(child?.effects?.settlementDiagnostic?.requiredOutput?.kind, "file-only");

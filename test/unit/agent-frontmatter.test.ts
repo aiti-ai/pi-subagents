@@ -695,7 +695,6 @@ Do work
 			defaultAsync: false,
 			defaultTimeoutMs: 90_000,
 			defaultToolTimeoutMs: 600_000,
-			defaultTurnBudget: { maxTurns: 12, graceTurns: 2 },
 			defaultAcceptance: { level: "none", reason: "lightweight lookup" },
 		};
 
@@ -703,7 +702,6 @@ Do work
 		assert.match(serialized, /^async: false$/m);
 		assert.match(serialized, /^timeoutMs: 90000$/m);
 		assert.match(serialized, /^toolTimeoutMs: 600000$/m);
-		assert.match(serialized, /^turnBudget: \{"maxTurns":12,"graceTurns":2\}$/m);
 		assert.match(serialized, /^acceptance: \{"level":"none","reason":"lightweight lookup"\}$/m);
 		writeAgent(filePath, serialized);
 
@@ -711,7 +709,6 @@ Do work
 		assert.equal(worker?.defaultAsync, false);
 		assert.equal(worker?.defaultTimeoutMs, 90_000);
 		assert.equal(worker?.defaultToolTimeoutMs, 600_000);
-		assert.deepEqual(worker?.defaultTurnBudget, { maxTurns: 12, graceTurns: 2 });
 		assert.deepEqual(worker?.defaultAcceptance, { level: "none", reason: "lightweight lookup" });
 	});
 
@@ -1436,6 +1433,39 @@ Inspect code
 		const result = discoverAgents(dir, "project");
 		const scout = result.agents.find((agent) => agent.name === "scout");
 		assert.equal(scout?.maxSubagentDepth, 1);
+	});
+});
+
+describe("agent frontmatter allowNestedSubagents", () => {
+	it("serializes and parses explicit nested fanout authorization", () => {
+		const agent: AgentConfig = {
+			name: "delegator",
+			description: "Delegator",
+			systemPrompt: "Delegate focused work",
+			systemPromptMode: "replace",
+			inheritProjectContext: false,
+			inheritSkills: false,
+			source: "project",
+			filePath: "/tmp/delegator.md",
+			allowNestedSubagents: true,
+		};
+		assert.match(serializeAgent(agent), /allowNestedSubagents: true/);
+
+		const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-subagents-agent-nested-fanout-"));
+		tempDirs.push(dir);
+		const agentsDir = path.join(dir, ".pi", "agents");
+		fs.mkdirSync(agentsDir, { recursive: true });
+		fs.writeFileSync(path.join(agentsDir, "delegator.md"), `---
+name: delegator
+description: Delegator
+allowNestedSubagents: true
+---
+
+Delegate focused work
+`, "utf-8");
+		const discovered = discoverAgents(dir, "project").agents.find((candidate) => candidate.name === "delegator");
+		assert.equal(discovered?.allowNestedSubagents, true);
+		assert.equal(discovered?.extraFields?.allowNestedSubagents, undefined);
 	});
 });
 

@@ -22,6 +22,7 @@ function withHost(value, fn) {
 
 const JOB_A = {
 	asyncDir: "/tmp/a",
+	asyncId: "aaaaaaaa-1111-2222-3333-444444444444", // [aiti] 0.59 起上游 lane 渲染路径读此字段（projectAsyncLane → asyncId.slice）
 	status: "running",
 	activityState: "active",
 	lastActivityAt: 1000,

@@ -58,12 +58,15 @@ import {
 	type Details,
 	type ForegroundResumeRun,
 	type SubagentState,
+	type Usage,
 	type WaitCompletion,
 } from "../../shared/types.ts";
 import { formatDuration, shortenPath } from "../../shared/formatters.ts";
+import { toAgentToolUsage } from "../../shared/utils.ts";
 import { collectWaitCompletions } from "./wait-completions.ts";
 import { formatResumeFirstFailedRunsNote } from "./resume-guidance.ts";
-export { WAIT_TOOL_ENABLED_ENV, resolveWaitToolConfig, type ResolvedWaitToolConfig } from "./wait-config.ts";
+import { formatTimeoutRecoveryLines } from "../shared/mutation-evidence.ts";
+export { WAIT_TOOL_DEFAULT_TIMEOUT_MS_ENV, WAIT_TOOL_ENABLED_ENV, resolveWaitToolConfig, type ResolvedWaitToolConfig } from "./wait-config.ts";
 
 /** States that mean a run is still in flight (not yet resolved). */
 const ACTIVE_STATES: ReadonlyArray<AsyncRunSummary["state"]> = ["queued", "running"];
@@ -84,7 +87,7 @@ export interface SubagentWaitParams {
 	 * targets a single run.
 	 */
 	all?: boolean;
-	/** Give up after this many milliseconds. Defaults to 30 minutes. */
+	/** Give up after this many milliseconds. Defaults to waitTool.defaultTimeoutMs, then 30 minutes. */
 	timeoutMs?: number;
 	/** False keeps a blocking wait open through idle attention; supervisor/contact requests still stop the wait. */
 	stopOnAttention?: boolean;
@@ -106,6 +109,8 @@ export interface SubagentWaitDeps {
 	pollIntervalMs?: number;
 	/** False makes the tool return immediately without blocking active async runs. */
 	enabled?: boolean;
+	/** Configured blocking window used when the call omits timeoutMs. */
+	defaultTimeoutMs?: number;
 	/** Injectable sleep for tests. */
 	sleep?: (ms: number, signal?: AbortSignal) => Promise<void>;
 	/** Internal auto-drain mode waits through needs-attention states. */
@@ -312,14 +317,61 @@ function summarizeTerminalRuns(runs: AsyncRunSummary[], providerFinishedCount = 
 	return parts.join(", ");
 }
 
+function completionUsage(completions: WaitCompletion[] | undefined): Usage | undefined {
+	if (!completions?.length) return undefined;
+	const usage: Usage = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 0 };
+	let projected = false;
+	for (const completion of completions) {
+		for (const child of completion.results ?? []) {
+			if (!child.usage || (child.usage.input === 0 && child.usage.output === 0 && child.usage.cacheRead === 0 && child.usage.cacheWrite === 0 && child.usage.cost === 0 && child.usage.turns === 0)) continue;
+			projected = true;
+			usage.input += child.usage.input;
+			usage.output += child.usage.output;
+			usage.cacheRead += child.usage.cacheRead;
+			usage.cacheWrite += child.usage.cacheWrite;
+			usage.cost += child.usage.cost;
+			usage.turns += child.usage.turns;
+		}
+	}
+	return projected ? usage : undefined;
+}
+
 function result(text: string, isError = false, completions?: WaitCompletion[]): AgentToolResult<Details> {
+	const usage = completionUsage(completions);
 	return {
 		content: [{ type: "text", text }],
 		...(isError ? { isError: true } : {}),
+		...(usage ? { usage: toAgentToolUsage(usage) } : {}),
 		details: {
 			mode: "management",
 			results: [],
 			...(completions && completions.length > 0 ? { completions } : {}),
+		},
+	};
+}
+
+function formatCompletionRecovery(completions: WaitCompletion[] | undefined): string {
+	const lines = (completions ?? []).flatMap((completion) =>
+		(completion.results ?? []).flatMap((child) => formatTimeoutRecoveryLines(child.timeoutRecovery)));
+	return lines.length > 0 ? `\n${lines.join("\n")}` : "";
+}
+
+function windowElapsedResult(
+	text: string,
+	activeRunIds: string[],
+	activeProviderItems: readonly RegisteredBackgroundWorkItem[] = [],
+): AgentToolResult<Details> {
+	return {
+		content: [{ type: "text", text }],
+		details: {
+			mode: "management",
+			results: [],
+			wait: {
+				reason: "window_elapsed",
+				timedOut: true,
+				activeRunIds,
+				activeProviderItems: activeProviderItems.map(({ provider, id }) => ({ provider, id })),
+			},
 		},
 	};
 }
@@ -471,9 +523,9 @@ async function waitForDetachedForegroundRun(
 			return result(`Wait aborted after ${formatDuration(now() - startedAt)}. Remembered foreground run "${run.runId}" remains detached. Reply to any pending supervisor request before resuming or launching a replacement.`, true);
 		}
 		if (now() - startedAt >= timeoutMs) {
-			return result(
-				`Wait timed out after ${formatDuration(timeoutMs)} with remembered foreground run "${run.runId}" still detached. Reply to any pending supervisor request, then call subagent_wait({ id: "${run.runId}" }) again or inspect status; do not resume or launch a replacement while it remains detached.`,
-				true,
+			return windowElapsedResult(
+				`Wait window elapsed after ${formatDuration(timeoutMs)} with remembered foreground run "${run.runId}" still detached. Reply to any pending supervisor request, then call subagent_wait({ id: "${run.runId}" }) again or inspect status; do not resume or launch a replacement while it remains detached.`,
+				[run.runId],
 			);
 		}
 		await waitForWake(pollIntervalMs, signal, deps);
@@ -499,7 +551,9 @@ export async function waitForSubagents(
 
 	const now = deps.now ?? Date.now;
 	const pollIntervalMs = Math.max(MIN_POLL_INTERVAL_MS, deps.pollIntervalMs ?? DEFAULT_POLL_INTERVAL_MS);
-	const timeoutMs = params.timeoutMs !== undefined && params.timeoutMs > 0 ? params.timeoutMs : DEFAULT_TIMEOUT_MS;
+	const timeoutMs = params.timeoutMs !== undefined && params.timeoutMs > 0
+		? params.timeoutMs
+		: deps.defaultTimeoutMs ?? DEFAULT_TIMEOUT_MS;
 	const startedAt = now();
 	const waitForAll = params.id ? true : params.all === true;
 	if (params.nonBlocking && !params.id) {
@@ -586,9 +640,10 @@ export async function waitForSubagents(
 			return result(`Wait aborted after ${formatDuration(now() - startedAt)}. Still active: ${stillActive}.`, true);
 		}
 		if (now() - startedAt >= timeoutMs) {
-			return result(
-				`Wait timed out after ${formatDuration(timeoutMs)} with ${activeInitialRuns.length} async run(s) and ${activeInitialProviderItems.length} provider item(s) still active: ${stillActive}. The work keeps going; call subagent_wait again or inspect subagent status.`,
-				true,
+			return windowElapsedResult(
+				`Wait window elapsed after ${formatDuration(timeoutMs)} with ${activeInitialRuns.length} async run(s) and ${activeInitialProviderItems.length} provider item(s) still active: ${stillActive}. The work keeps going; call subagent_wait again or inspect subagent status.`,
+				activeInitialRuns.map((run) => run.id),
+				activeInitialProviderItems,
 			);
 		}
 		try {
@@ -618,7 +673,7 @@ export async function waitForSubagents(
 		const allNow = runsForIds(initialAsyncIds, deps);
 		const terminal = allNow.filter((run) => !ACTIVE_STATES.includes(run.state) && initialAsyncIds.has(run.id));
 		finishedAsyncCount = terminal.length;
-		failedAsyncCount = terminal.filter((run) => run.state === "failed").length;
+		failedAsyncCount = terminal.filter((run) => run.state === "failed" || run.state === "partial").length;
 		terminalSummary = summarizeTerminalRuns(terminal, providerFinishedCount);
 		resumeGuidance = formatResumeFirstFailedRunsNote(terminal);
 		completions = collectWaitCompletions(terminal, deps.state, deps.resultsDir ?? DIRS.results);
@@ -637,6 +692,7 @@ export async function waitForSubagents(
 		+ providerActive.filter((item) => initialProviderIds.has(backgroundWorkIdentity(item))).length;
 	const elapsed = formatDuration(now() - startedAt);
 	const outcome = terminalSummary ? ` Outcome: ${terminalSummary}.` : "";
+	const recoveryNote = formatCompletionRecovery(completions);
 
 	if (waitForAll) {
 		const scope = params.id
@@ -646,7 +702,7 @@ export async function waitForSubagents(
 				: `${initialAsyncIds.size} async run(s) and ${initialProviderIds.size} provider item(s)`;
 		const status = relevantAttention.length > 0 ? "attention required" : "done";
 		return result(
-			`Waited ${elapsed} for ${scope}; ${status}.${outcome}${resumeGuidance}${attentionNote} Completion/control events have been observed; inspect status if a notification is not visible yet.`,
+			`Waited ${elapsed} for ${scope}; ${status}.${outcome}${recoveryNote}${resumeGuidance}${attentionNote} Completion/control events have been observed; inspect status if a notification is not visible yet.`,
 			(deps.failOnFailedRuns === true && failedAsyncCount > 0) || (deps.failOnAttention === true && relevantAttention.length > 0),
 			completions,
 		);
@@ -663,7 +719,7 @@ export async function waitForSubagents(
 		? `${relevantAttention.length} of ${initialCount} ${subject} need attention`
 		: `${finishedCount} of ${initialCount} ${subject} finished`;
 	return result(
-		`Waited ${elapsed}; ${progress}.${outcome}${resumeGuidance}${attentionNote}${remainder} Relevant completion/control events have been observed; inspect status if a notification is not visible yet.`,
+		`Waited ${elapsed}; ${progress}.${outcome}${recoveryNote}${resumeGuidance}${attentionNote}${remainder} Relevant completion/control events have been observed; inspect status if a notification is not visible yet.`,
 		(deps.failOnFailedRuns === true && failedAsyncCount > 0) || (deps.failOnAttention === true && relevantAttention.length > 0),
 		completions,
 	);

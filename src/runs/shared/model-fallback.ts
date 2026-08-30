@@ -24,7 +24,12 @@ export function formatSubagentModelVerificationError(expectedModel: string, obse
 	const observedBase = splitThinkingSuffix(observedModel).baseModel;
 	if (expectedBase === observedBase) return undefined;
 	const expectedEntry = availableModels.find((entry) => entry.fullId === expectedBase);
-	if (expectedEntry && expectedEntry.id === observedBase) return undefined;
+	if (expectedEntry) {
+		if (expectedEntry.id === observedBase) return undefined;
+		const expectedIdLeaf = expectedEntry.id.slice(expectedEntry.id.lastIndexOf("/") + 1);
+		const expectedFullIdLeaf = expectedEntry.fullId.slice(expectedEntry.fullId.lastIndexOf("/") + 1);
+		if (expectedIdLeaf === observedBase || expectedFullIdLeaf === observedBase) return undefined;
+	}
 	return `model_verification_failed: child reported a different model than the launch candidate. Expected '${expectedModel}' but observed '${observedModel}'.`;
 }
 
@@ -446,9 +451,11 @@ const RETRYABLE_MODEL_FAILURE_PATTERNS = [
 	/upstream/i,
 	/timed? out/i,
 	/timeout/i,
+	/\b500\b/,
 	/\b502\b/,
 	/\b503\b/,
 	/\b504\b/,
+	/internal server error/i,
 	/cold.?start/i,
 	/empty response/i,
 	/no output/i,
@@ -479,7 +486,7 @@ function messageError(message: unknown): string | undefined {
 export function isRetryableModelFailureAttempt(input: { error: string | undefined; messages?: readonly unknown[]; toolCount?: number }): boolean {
 	if (!isRetryableModelFailure(input.error)) return false;
 	if ((input.toolCount ?? 0) > 0) return false;
-	if (input.error === "Subagent produced no output (possible model cold-start or empty response).") return true;
+	if (input.error === "Subagent produced no output (possible model cold-start or empty response)." || /^Subagent produced no output after terminal assistant stopReason "[^"]+"\.$/.test(input.error ?? "")) return true;
 	if ((input.toolCount ?? 0) === 0 && (input.messages?.length ?? 0) === 0) return true;
 	const error = input.error?.trim();
 	return Boolean(error && input.messages?.some((message) => messageError(message)?.trim() === error));

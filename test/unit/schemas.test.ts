@@ -34,6 +34,7 @@ interface SubagentParamsSchema {
 			minLength?: number;
 			description?: string;
 		};
+		preflight?: JsonSchemaNode;
 		chatProgress?: {
 			type?: string;
 			enum?: string[];
@@ -75,6 +76,10 @@ interface SubagentParamsSchema {
 		action?: {
 			type?: string;
 			enum?: string[];
+			description?: string;
+		};
+		capabilities?: {
+			type?: string;
 			description?: string;
 		};
 		view?: {
@@ -186,6 +191,9 @@ describe("SubagentParams schema", { skip: !schemasAvailable ? "typebox not avail
 		assert.equal(workflowScript?.type, "string");
 		assert.equal(workflowScript?.minLength, 1);
 		assert.match(String(workflowScript?.description ?? ""), /runs\.run/);
+		assert.match(String(workflowScript?.description ?? ""), /runs\.lanes\(\[\{key,stages:/);
+		assert.match(String(workflowScript?.description ?? ""), /first stages run together.*later stages sequence per lane/i);
+		assert.match(String(workflowScript?.description ?? ""), /Each workflow key identifies one result lane.*new stable workflow key.*retained resume pass/i);
 		assert.match(String(workflowScript?.description ?? ""), /await runs\.all\(\[\{key, agent, task\}, \.\.\.\]\)/);
 		assert.match(String(workflowScript?.description ?? ""), /do not read \.output from unawaited runs\.run launches/i);
 		assert.match(String(workflowScript?.description ?? ""), /advanced rolling fanout/);
@@ -198,6 +206,13 @@ describe("SubagentParams schema", { skip: !schemasAvailable ? "typebox not avail
 		assert.match(String(workflowScriptPath?.description ?? ""), /mutually exclusive with workflowScript/i);
 		assert.match(String(workflowScriptPath?.description ?? ""), /request cwd/i);
 		assert.match(String(workflowScriptPath?.description ?? ""), /host reads the file/i);
+		const preflight = SubagentParams?.properties?.preflight;
+		assert.equal(preflight?.type, "object");
+		assert.equal(preflight?.additionalProperties, false);
+		assert.match(String(preflight?.description ?? ""), /display-only/i);
+		assert.equal((preflight?.properties as JsonSchemaNode | undefined)?.version?.minimum, 1);
+		assert.equal((preflight?.properties as JsonSchemaNode | undefined)?.version?.maximum, 1);
+		assert.equal((preflight?.properties as JsonSchemaNode | undefined)?.lanes?.maxItems, 64);
 		const chatProgress = SubagentParams?.properties?.chatProgress;
 		assert.equal(chatProgress?.type, "string");
 		assert.deepEqual(chatProgress?.enum, ["auto", "off", "live-card"]);
@@ -220,14 +235,15 @@ describe("SubagentParams schema", { skip: !schemasAvailable ? "typebox not avail
 		assert.match(String((properties?.agent as JsonSchemaNode | undefined)?.description ?? ""), /one-child/i);
 		assert.equal(properties?.clarify, undefined, "clarify should not be model-facing");
 		assert.ok(properties?.output, "output remains a workflow child default");
+		assert.match(String(properties?.output?.description ?? ""), /Relative workflow child paths use managed artifact routing/i);
+		assert.match(String(properties?.output?.description ?? ""), /Task filename prose is not an output declaration/i);
+		assert.match(String(properties?.output?.description ?? ""), /outputReference.*outputPathMapping.*artifactPaths/i);
 	});
 
 	it("omits removed legacy and workflow-child-only fields", () => {
 		for (const name of ["tasks", "chain", "concurrency", "chainDir", "step", "schedule", "scheduleName", "resume"]) {
 			assert.equal((SubagentParams?.properties as Record<string, unknown> | undefined)?.[name], undefined, `${name} should not be public`);
 		}
-
-		assert.doesNotMatch(JSON.stringify(SubagentParams), /append-step|approve-checkpoint|reject-checkpoint|scheduleName/);
 	});
 
 	it("allows runtime validation of management and control action strings", () => {
@@ -243,6 +259,22 @@ describe("SubagentParams schema", { skip: !schemasAvailable ? "typebox not avail
 		assert.doesNotMatch(description, /orchestration\./);
 	});
 
+	it("accepts prompt-free capability discovery on list requests", () => {
+		const capabilitiesSchema = SubagentParams?.properties?.capabilities;
+		assert.ok(capabilitiesSchema, "capabilities schema should exist");
+		assert.equal(capabilitiesSchema.type, "boolean");
+		const description = String(capabilitiesSchema.description ?? "");
+		assert.match(description, /action=['\"]list['\"]/i);
+		assert.match(description, /compact/i);
+		assert.match(description, /system prompt/i);
+
+		if (CompileSchema) {
+			const validator = CompileSchema(SubagentParams);
+			assert.equal(validator.Check({ action: "list", capabilities: true }), true);
+			assert.equal(validator.Check({ action: "list", capabilities: "true" }), false);
+		}
+	});
+
 	it("keeps agentContract.version as integer bounds without an enum (Gemini schema subset)", () => {
 		const agentContract = (SubagentParams?.properties as Record<string, JsonSchemaNode> | undefined)?.agentContract;
 		assert.ok(agentContract, "agentContract schema should exist");
@@ -254,7 +286,7 @@ describe("SubagentParams schema", { skip: !schemasAvailable ? "typebox not avail
 		assert.equal(version.enum, undefined);
 	});
 
-	it("documents workflow timeout aliases and turn budget", () => {
+	it("documents workflow timeout aliases and omits removed turn budgets", () => {
 		const timeoutSchema = SubagentParams?.properties?.timeoutMs;
 		const maxRuntimeSchema = SubagentParams?.properties?.maxRuntimeMs;
 		const turnBudgetSchema = SubagentParams?.properties?.turnBudget;
@@ -271,8 +303,7 @@ describe("SubagentParams schema", { skip: !schemasAvailable ? "typebox not avail
 		assert.match(String(maxRuntimeSchema.description ?? ""), /foreground and single async runs/i);
 		assert.match(String(maxRuntimeSchema.description ?? ""), /use config timeoutMs, else 30m/i);
 		assert.match(String(maxRuntimeSchema.description ?? ""), /async composites have no default parent deadline/i);
-		assert.equal(turnBudgetSchema?.properties?.maxTurns?.minimum, 1);
-		assert.equal(turnBudgetSchema?.properties?.graceTurns?.minimum, 0);
+		assert.equal(turnBudgetSchema, undefined);
 		assert.equal(toolBudgetSchema?.properties?.soft?.minimum, 1);
 		assert.equal(toolBudgetSchema?.properties?.hard?.minimum, 1);
 	});
@@ -339,9 +370,12 @@ describe("SubagentParams schema", { skip: !schemasAvailable ? "typebox not avail
 	it("exposes tolerant wait mode on subagent_wait", () => {
 		const properties = SubagentWaitParams?.properties as Record<string, JsonSchemaNode> | undefined;
 		const stopOnAttention = properties?.stopOnAttention;
+		const timeoutMs = properties?.timeoutMs;
 		assert.ok(stopOnAttention, "stopOnAttention schema should exist");
 		assert.equal(stopOnAttention.type, "boolean");
 		assert.match(String(stopOnAttention.description ?? ""), /idle or long-thinking attention/);
+		assert.match(String(timeoutMs?.description ?? ""), /waitTool\.defaultTimeoutMs/);
+		assert.match(String(timeoutMs?.description ?? ""), /non-error active-work result/);
 	});
 
 	it("does not emit description-only schema nodes", () => {
@@ -404,8 +438,8 @@ describe("SubagentParams schema", { skip: !schemasAvailable ? "typebox not avail
 		assert.ok(SubagentParams, "SubagentParams schema should exist");
 		const schema = SubagentParams as unknown as JsonSchemaNode;
 		const serialized = JSON.stringify(schema);
-		// Mission, inspector, inline workflow, guide, and toolTimeoutMs fields intentionally expanded the public tool surface.
-		assert.ok(serialized.length < 17_400, `expected compact schema under 17.4k chars, got ${serialized.length}`);
+		// Mission, inspector, inline workflow, guide, toolTimeoutMs, and capability-list fields intentionally expanded the public tool surface.
+		assert.ok(serialized.length < 17_600, `expected compact schema under 17.6k chars, got ${serialized.length}`);
 		assert.equal(serialized.includes('"$ref"'), false);
 		assert.equal(serialized.includes('"$defs"'), false);
 		assert.equal(serialized.split("Optional acceptance policy.").length - 1, 1);
@@ -556,11 +590,6 @@ describe("SubagentParams schema", { skip: !schemasAvailable ? "typebox not avail
 			{ agent: "worker", task: "Fix", acceptance: true },
 			{ config: [] },
 			{ config: null },
-			{ agent: "worker", task: "Fix", turnBudget: { maxTurns: 0 } },
-			{ agent: "worker", task: "Fix", turnBudget: { maxTurns: 5, graceTurns: -1 } },
-			{ agent: "worker", task: "Fix", turnBudget: { maxTurns: 1.5 } },
-			{ agent: "worker", task: "Fix", turnBudget: { graceTurns: 1 } },
-			{ agent: "worker", task: "Fix", turnBudget: { maxTurns: 5, graceTurns: 1, extra: true } },
 			{ agent: "worker", task: "Fix", toolBudget: { hard: 0 } },
 			{ agent: "worker", task: "Fix", toolBudget: { hard: 3, soft: 0 } },
 			{ agent: "worker", task: "Fix", toolBudget: { hard: 3, block: [123] } },

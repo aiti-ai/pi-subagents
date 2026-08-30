@@ -6,7 +6,8 @@ import { afterEach, describe, it } from "node:test";
 import { buildWorkflowReceipt, readWorkflowReceipt, resolveWorkflowReceiptResume, workflowReceiptPath, writeWorkflowReceipt } from "../../src/workflows/workflow-receipt.ts";
 import { externalCliReceiptMetadata, resolveExternalCliRunnerStatus } from "../../src/runs/shared/external-cli-contract.ts";
 import type { WorkflowScriptChildResult } from "../../src/workflows/scripted-workflow.ts";
-import { workflowChildSummary } from "../../src/workflows/workflow-child-summary.ts";
+import type { HostStepNodeV1 } from "../../src/shared/types.ts";
+import { parseWorkflowChildSummary, workflowChildSummary } from "../../src/workflows/workflow-child-summary.ts";
 
 const roots: string[] = [];
 
@@ -38,6 +39,20 @@ function child(key: string, overrides: Partial<WorkflowScriptChildResult> = {}):
 	};
 }
 
+function hostStep(overrides: Partial<HostStepNodeV1> = {}): HostStepNodeV1 {
+	return {
+		version: 1,
+		kind: "host-step",
+		monitorKind: "gate",
+		id: "gate-1",
+		label: "Review gate",
+		state: "done",
+		verdict: "pass",
+		updatedAt: 10,
+		...overrides,
+	};
+}
+
 describe("workflow receipts", () => {
 	it("reads old receipt-v1 files without external adapter metadata", () => {
 		const asyncRoot = tempRoot();
@@ -52,6 +67,31 @@ describe("workflow receipts", () => {
 		}));
 
 		assert.equal(readWorkflowReceipt(asyncRoot, "workflow-old").entries.advisor?.externalAdapter, undefined);
+	});
+
+	it("round-trips bounded host CI/gate state in terminal receipts", () => {
+		const asyncRoot = tempRoot();
+		const asyncDir = path.join(asyncRoot, "workflow-host");
+		fs.mkdirSync(asyncDir, { recursive: true });
+		const receipt = buildWorkflowReceipt({
+			workflowRunId: "workflow-host",
+			state: "complete",
+			children: [],
+			hostSteps: [hostStep({ monitorKind: "ci", id: "ci-1", label: "CI checks", provider: "opaque-provider", state: "done", verdict: "inconclusive", reasonCode: "stale-head", freshness: { expectedRef: "old", observedRef: "new", stale: true }, reportPath: "/private/report.json" })],
+			createdAt: 10,
+		});
+		writeWorkflowReceipt(asyncDir, receipt);
+		assert.deepEqual(readWorkflowReceipt(asyncRoot, "workflow-host").hostSteps, receipt.hostSteps);
+		assert.equal(JSON.stringify(receipt).includes("/private/report.json"), true);
+	});
+
+	it("reads inconclusive host monitor receipt state without a verdict", () => {
+		const asyncRoot = tempRoot();
+		const asyncDir = path.join(asyncRoot, "workflow-host-inconclusive");
+		fs.mkdirSync(asyncDir, { recursive: true });
+		const receipt = buildWorkflowReceipt({ workflowRunId: "workflow-host-inconclusive", state: "complete", children: [] });
+		fs.writeFileSync(workflowReceiptPath(asyncRoot, "workflow-host-inconclusive"), JSON.stringify({ ...receipt, hostSteps: [{ ...hostStep(), state: "done", verdict: undefined }] }));
+		assert.equal(readWorkflowReceipt(asyncRoot, "workflow-host-inconclusive").hostSteps?.[0]?.verdict, undefined);
 	});
 
 	it("reads legacy Grok receipt metadata after the active profile is removed", () => {
@@ -143,6 +183,21 @@ describe("workflow receipts", () => {
 		assert.deepEqual(readWorkflowReceipt(asyncRoot, "workflow-1").workflowChildren, summary);
 	});
 
+	it("round-trips long parent tool-call ids while rejecting ids over the summary bound", () => {
+		const parentToolCallId = `call_${"x".repeat(500)}`;
+		const summary = workflowChildSummary({ parentToolCallId, workflowRunId: "workflow-long-tool-call", workflowState: "completed", inventoryComplete: true });
+		const asyncRoot = tempRoot();
+		const asyncDir = path.join(asyncRoot, "workflow-long-tool-call");
+		fs.mkdirSync(asyncDir, { recursive: true });
+		writeWorkflowReceipt(asyncDir, buildWorkflowReceipt({ workflowRunId: "workflow-long-tool-call", state: "complete", children: [], workflowChildren: summary, createdAt: 10 }));
+		assert.equal(readWorkflowReceipt(asyncRoot, "workflow-long-tool-call").workflowChildren?.parentToolCallId, parentToolCallId);
+
+		const overBoundParentToolCallId = `call_${"x".repeat(4_091)}`;
+		assert.equal(workflowChildSummary({ parentToolCallId: overBoundParentToolCallId, workflowRunId: "workflow-long-tool-call", workflowState: "completed", inventoryComplete: true }).parentToolCallId, overBoundParentToolCallId);
+		assert.throws(() => workflowChildSummary({ parentToolCallId: `${overBoundParentToolCallId}x`, workflowRunId: "workflow-long-tool-call", workflowState: "completed", inventoryComplete: true }), /at most 4096 UTF-8 bytes/);
+		assert.throws(() => parseWorkflowChildSummary({ ...summary, parentToolCallId: `${overBoundParentToolCallId}x` }), /at most 4096 UTF-8 bytes/);
+	});
+
 	it("uses workflow keys when flattened child indexes collide", () => {
 		const summary = workflowChildSummary({
 			parentToolCallId: "tool-call",
@@ -164,6 +219,23 @@ describe("workflow receipts", () => {
 	it("rejects a summary bound to a different workflow", () => {
 		const summary = workflowChildSummary({ parentToolCallId: "tool", workflowRunId: "other", workflowState: "completed", inventoryComplete: true });
 		assert.throws(() => buildWorkflowReceipt({ workflowRunId: "workflow-1", state: "complete", children: [], workflowChildren: summary }), /does not match its receipt/);
+	});
+
+	it("round-trips bounded lane metadata and rejects mismatched receipt identity", () => {
+		const lane = { version: 1 as const, key: "advisor", mode: "review" as const, sourceRef: "owner/repo#1621", claims: ["src/shared/types.ts"], outputPaths: ["reports/advisor.md"] };
+		const receipt = buildWorkflowReceipt({ workflowRunId: "workflow-lane", state: "complete", children: [child("advisor", { lane })], createdAt: 10 });
+		const asyncRoot = tempRoot();
+		const asyncDir = path.join(asyncRoot, "workflow-lane");
+		fs.mkdirSync(asyncDir, { recursive: true });
+		writeWorkflowReceipt(asyncDir, receipt);
+		assert.deepEqual(readWorkflowReceipt(asyncRoot, "workflow-lane").entries.advisor?.lane, lane);
+		assert.throws(() => buildWorkflowReceipt({ workflowRunId: "workflow-lane", state: "complete", children: [child("advisor", { lane: { ...lane, key: "other" } })] }), /does not match workflow key/);
+
+		const receiptPath = workflowReceiptPath(asyncRoot, "workflow-lane");
+		const malformed = JSON.parse(fs.readFileSync(receiptPath, "utf-8")) as { entries: { advisor: { lane: { key: string } } } };
+		malformed.entries.advisor.lane.key = "other";
+		fs.writeFileSync(receiptPath, JSON.stringify(malformed), "utf-8");
+		assert.throws(() => readWorkflowReceipt(asyncRoot, "workflow-lane"), /does not match workflow key/);
 	});
 
 	it("rejects non-string workflow-child summary identifiers", () => {
@@ -319,5 +391,41 @@ describe("workflow receipts", () => {
 			() => resolveWorkflowReceiptResume({ reference: { workflowRunId: "workflow-external", key: "advisor", latest: true }, asyncDirRoot: asyncRoot }),
 			/not resumable: The one-shot stdin adapter has no durable external session identity/,
 		);
+	});
+});
+
+describe("workflow child session names", () => {
+	it("persists a bounded child session name from async status", () => {
+		const summary = workflowChildSummary({
+			parentToolCallId: "tool-call",
+			workflowRunId: "workflow-1",
+			workflowState: "completed",
+			inventoryComplete: true,
+			steps: [{
+				agent: "reviewer",
+				sessionName: "reviewer: Inspect the changed auth middleware",
+				workflowKey: "review",
+				status: "complete",
+			}],
+		});
+		assert.equal(summary.children[0]?.sessionName, "reviewer: Inspect the changed auth middleware");
+	});
+
+	it("rejects unbounded session names in persisted workflow summaries", () => {
+		const root = tempRoot();
+		const asyncDir = path.join(root, "workflow-1");
+		fs.mkdirSync(asyncDir, { recursive: true });
+		writeWorkflowReceipt(asyncDir, {
+			...buildWorkflowReceipt({ workflowRunId: "workflow-1", state: "complete", children: [] }),
+			workflowChildren: {
+				version: 1,
+				parentToolCallId: "tool",
+				workflowRunId: "workflow-1",
+				inventoryComplete: true,
+				workflowState: "completed",
+				children: [{ childId: "review", state: "completed", sessionName: "x".repeat(257) }],
+			},
+		});
+		assert.throws(() => readWorkflowReceipt(root, "workflow-1"), /sessionName is invalid/);
 	});
 });

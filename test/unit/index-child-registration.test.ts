@@ -476,7 +476,6 @@ describe("subagent extension child mode", () => {
 				const lines = result.render(120);
 				if (lines.length !== 6) throw new Error("expected outer spacer, box rows, and three capped result rows: " + JSON.stringify(lines));
 				if (!lines[4].includes("rows hidden")) throw new Error("compact cap was not applied: " + JSON.stringify(lines));
-				if (!lines[3].includes(" ✓ Agent 1/3: scout")) throw new Error("zero spacing was not applied: " + JSON.stringify(lines));
 			`;
 			const env = parentToolEnv();
 			env.PI_CODING_AGENT_DIR = agentDir;
@@ -1003,6 +1002,54 @@ describe("subagent extension child mode", () => {
 		}
 	});
 
+	it("ignores the current stale UI context during runtime reload cleanup", () => {
+		const agentDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-subagents-stale-ui-reload-"));
+		const configDir = path.join(agentDir, "extensions", "subagent");
+		fs.mkdirSync(configDir, { recursive: true });
+		fs.writeFileSync(path.join(configDir, "config.json"), JSON.stringify({ asyncWidget: false, fleetView: false }), "utf-8");
+		const script = String.raw`
+			import registerSubagentExtension from "./index.ts";
+			const handlers = new Map();
+			const events = { on() { return () => {}; }, emit() {} };
+			const fakePi = new Proxy({
+				events,
+				on(channel, handler) { handlers.set(channel, handler); },
+				registerTool() {}, registerCommand() {}, registerShortcut() {}, registerMessageRenderer() {},
+				sendMessage() {}, getSessionName() { return undefined; },
+			}, { get(target, prop) { return prop in target ? target[prop] : () => undefined; } });
+			let stale = false;
+			const ctx = {
+				cwd: process.cwd(),
+				get hasUI() {
+					if (stale) throw new Error("This extension ctx is stale after session replacement or reload.");
+					return true;
+				},
+				ui: {
+					setWidget() {}, requestRender() {}, setToolsExpanded() {}, getToolsExpanded() { return false; },
+					theme: { fg(_name, text) { return text; }, bg(_name, text) { return text; }, bold(text) { return text; } },
+				},
+				sessionManager: { getSessionId() { return "stale-ui-session"; }, getSessionFile() { return null; }, getEntries() { return []; } },
+				modelRegistry: { getAvailable() { return []; } },
+			};
+			registerSubagentExtension(fakePi);
+			handlers.get("session_start")({ reason: "startup" }, ctx);
+			stale = true;
+			handlers.get("session_shutdown")({ reason: "reload" });
+		`;
+
+		try {
+			const env = parentToolEnv(agentDir);
+			env.PI_CODING_AGENT_DIR = agentDir;
+			execFileSync(
+				process.execPath,
+				["--experimental-strip-types", "--import", "./test/support/register-loader.mjs", "--input-type=module", "--eval", script],
+				{ cwd: projectRoot, env, stdio: "pipe" },
+			);
+		} finally {
+			fs.rmSync(agentDir, { recursive: true, force: true });
+		}
+	});
+
 	it("claims the explicit predecessor session during session replacement", () => {
 		const agentDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-subagents-session-transition-"));
 		const configDir = path.join(agentDir, "extensions", "subagent");
@@ -1205,32 +1252,6 @@ describe("subagent extension child mode", () => {
 			],
 			{ cwd: projectRoot, stdio: "pipe" },
 		);
-	});
-
-	it("omits legacy chain controls from the child-safe fanout tool", () => {
-		const readRegisteredTool = (): { description: string; properties: string[]; id: string; runId: string } => {
-			const agentDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-subagents-fanout-schema-"));
-			fs.mkdirSync(path.join(agentDir, "extensions", "subagent"), { recursive: true });
-			const script = String.raw`
-				import registerFanoutChildSubagentExtension from "./src/extension/fanout-child.ts";
-				import { SUBAGENT_CHILD_ENV, SUBAGENT_FANOUT_CHILD_ENV } from "./src/runs/shared/pi-args.ts";
-				process.env[SUBAGENT_CHILD_ENV] = "1";
-				process.env[SUBAGENT_FANOUT_CHILD_ENV] = "1";
-				let tool;
-				registerFanoutChildSubagentExtension({ events: { on() { return () => {}; }, emit() {} }, registerTool(value) { tool = value; }, getSessionName() { return undefined; } });
-				process.stdout.write(JSON.stringify({ description: tool.description, properties: Object.keys(tool.parameters.properties), id: tool.parameters.properties.id.description, runId: tool.parameters.properties.runId.description }));
-			`;
-			const output = execFileSync(process.execPath, ["--experimental-strip-types", "--import", "./test/support/register-loader.mjs", "--input-type=module", "--eval", script], {
-				cwd: projectRoot,
-				env: parentToolEnv(agentDir),
-				encoding: "utf-8",
-			});
-			return JSON.parse(output) as { description: string; properties: string[]; id: string; runId: string };
-		};
-
-		const tool = readRegisteredTool();
-		assert.equal(tool.properties.includes("step"), false);
-		assert.doesNotMatch(`${tool.description}\n${tool.id}\n${tool.runId}`, /append-step|approve-checkpoint|reject-checkpoint/);
 	});
 
 	it("lets fanout children call read-only list but blocks mutating management actions", () => {

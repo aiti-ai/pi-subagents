@@ -5,7 +5,6 @@
 import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import * as fs from "node:fs";
-import * as os from "node:os";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import { createRequire } from "node:module";
@@ -14,18 +13,20 @@ import { discoverAgents, formatUnknownAgentError, unknownAgentDiagnosticContext,
 import { appendAgentRefinementOverlay } from "../../agents/agent-refinements.ts";
 import { writePrivateAtomicJson } from "../../shared/atomic-json.ts";
 import { currentCompletionOwnerId } from "../../shared/completion-owner.ts";
+import { planChildLaunch, resolveStepBehavior, suppressProgressForReadOnlyTask, type ResolvedStepBehavior } from "../shared/child-launch-plan.ts";
 import { applyThinkingSuffix, projectLaunchResolvedChildExtensions, resolvePiLaunchToolPlan } from "../shared/pi-args.ts";
 import { injectOutputPathSystemPrompt, injectSingleOutputInstruction, normalizeSingleOutputOverride, resolveSingleOutputPath, validateFileOnlyOutputMode } from "../shared/single-output.ts";
-import { buildChainInstructions, isDynamicParallelStep, isParallelStep, resolveChainPath, resolveExistingReadPaths, resolveStepBehavior, suppressProgressForReadOnlyTask, writeInitialProgressFile, type ChainStep, type ResolvedStepBehavior, type SequentialStep, type StepOverrides } from "../../shared/settings.ts";
+import { buildChainInstructions, isDynamicParallelStep, isParallelStep, resolveExistingReadPaths, writeInitialProgressFile, type ChainStep, type SequentialStep, type StepOverrides } from "../../shared/settings.ts";
 import type { RunnerStep } from "../shared/parallel-utils.ts";
 import type { ContextMode } from "../shared/context-mode.ts";
 import { resolvePiPackageRoot } from "../shared/pi-spawn.ts";
 import { preflightLaunchCwd } from "../shared/launch-cwd.ts";
 import { resolveNodeExecutable } from "../../shared/node-executable.ts";
+import { backgroundProcessOptions } from "../shared/background-process-options.ts";
 import { buildSkillInjection, normalizeSkillInput, resolveSkillsWithFallback } from "../../agents/skills.ts";
 import { buildAgentMemoryInjection } from "../../agents/agent-memory.ts";
 import { PI_CODING_AGENT_PACKAGE_ROOT_ENV, PROMPT_REDACTED, resolveChildCwd } from "../../shared/utils.ts";
-import { buildModelCandidates, inheritsParentModel, resolveEffectiveSubagentModel, resolveModelCandidate, resolveSubagentModelOverride, type AvailableModelInfo, type ParentModel } from "../shared/model-fallback.ts";
+import { buildModelCandidates, inheritsParentModel, resolveEffectiveSubagentModel, resolveSubagentModelOverride, type AvailableModelInfo, type ParentModel } from "../shared/model-fallback.ts";
 import { resolveToolTimeoutMs, toolTimeoutFromEnv } from "../shared/tool-timeout.ts";
 import { resolveModelScopesForAgent, type ModelScopeConfig } from "../shared/model-scope.ts";
 import { findModelInfo, resolveEffectiveThinking } from "../../shared/model-info.ts";
@@ -49,12 +50,12 @@ import {
 	type MaxOutputConfig,
 	type NestedRouteInfo,
 	type ResolvedControlConfig,
-	type ResolvedTurnBudget,
 	type ResolvedToolBudget,
 	type RunFanoutBudgetDescriptor,
 	type ToolBudgetConfig,
 	type SubagentRunMode,
 	type SteeringRecoveryDescriptor,
+	type WorkflowLaneMetadata,
 	type UsageBudgetConfig,
 	DIRS,
 	SUBAGENT_ASYNC_STARTED_EVENT,
@@ -65,7 +66,6 @@ import {
 } from "../../shared/types.ts";
 import { nestedResultsPath, nestedSummaryFromAsyncStatus, resolveInheritedNestedRouteFromEnv, resolveNestedParentAddressFromEnv, writeNestedEvent } from "../shared/nested-events.ts";
 import { resultFilePath } from "./result-files.ts";
-import { appendTurnBudgetSystemPrompt, initialTurnBudgetState } from "../shared/turn-budget.ts";
 import { validateToolBudgetConfig } from "../shared/tool-budget.ts";
 import { usageBudgetState } from "../shared/usage-budget.ts";
 import type { ImportedAsyncRoot } from "./chain-root-attachment.ts";
@@ -78,6 +78,7 @@ import { assertAgentAllowedByCapabilityCeiling, decodeSubagentCapabilityCeiling,
 import { agentDefinitionDigest, launchBindingDigest } from "../../shared/launch-contract.ts";
 import { resolvePermissionRules, type PermissionConfig } from "../shared/permissions.ts";
 import { normalizeExtensionBindings, omitExtensionBindingsEnv, type ExtensionBindings } from "../shared/extension-bindings.ts";
+import { assertWorkflowLaneKey, normalizeWorkflowLaneMetadata } from "../shared/lane-metadata.ts";
 
 const require = createRequire(import.meta.url);
 const piPackageRoot = resolvePiPackageRoot();
@@ -173,6 +174,7 @@ interface AsyncChainParams {
 	dynamicFanoutMaxItems?: number;
 	maxSubagentDepth: number;
 	waitToolEnabled?: boolean;
+	waitToolDefaultTimeoutMs?: number;
 	worktreeSetupHook?: string;
 	worktreeSetupHookTimeoutMs?: number;
 	worktreeBaseDir?: string;
@@ -183,7 +185,6 @@ interface AsyncChainParams {
 	acceptance?: AcceptanceInput;
 	fast?: boolean;
 	timeoutMs?: number;
-	turnBudget?: ResolvedTurnBudget;
 	toolBudget?: ResolvedToolBudget;
 	usageBudget?: UsageBudgetConfig;
 	configToolBudget?: ResolvedToolBudget;
@@ -200,6 +201,7 @@ interface AsyncChainParams {
 	runFanoutBudget?: RunFanoutBudgetDescriptor;
 	parentWorkflowRunId?: string;
 	workflowKey?: string;
+	lane?: WorkflowLaneMetadata;
 	activeAsyncCapacity?: ActiveAsyncCapacityHandle;
 }
 
@@ -228,6 +230,7 @@ interface AsyncSingleParams {
 	reads?: string[] | false;
 	outputMode?: "inline" | "file-only";
 	outputBaseDir?: string;
+	outputClaimPath?: string;
 	agentContract?: AgentContract;
 	structuredOutputSchema?: JsonSchemaObject;
 	modelOverride?: string;
@@ -237,6 +240,7 @@ interface AsyncSingleParams {
 	availableModels?: AvailableModelInfo[];
 	maxSubagentDepth: number;
 	waitToolEnabled?: boolean;
+	waitToolDefaultTimeoutMs?: number;
 	worktreeSetupHook?: string;
 	worktreeSetupHookTimeoutMs?: number;
 	worktreeBaseDir?: string;
@@ -251,7 +255,6 @@ interface AsyncSingleParams {
 	absoluteDeadlineAt?: number;
 	/** Optional per-call hard toolTimeoutMs override (highest precedence). */
 	toolTimeoutMs?: number;
-	turnBudget?: { maxTurns: number; graceTurns?: number };
 	toolBudget?: ResolvedToolBudget | ToolBudgetConfig;
 	usageBudget?: UsageBudgetConfig;
 	configToolBudget?: ResolvedToolBudget;
@@ -265,6 +268,7 @@ interface AsyncSingleParams {
 	runFanoutBudget?: RunFanoutBudgetDescriptor;
 	parentWorkflowRunId?: string;
 	workflowKey?: string;
+	lane?: WorkflowLaneMetadata;
 	workflowAwaitAsync?: boolean;
 	activeAsyncCapacity?: ActiveAsyncCapacityHandle;
 	externalJobFollowUp?: {
@@ -303,6 +307,7 @@ export interface AsyncRunnerStepBuildParams {
 	dynamicFanoutMaxItems?: number;
 	maxSubagentDepth: number;
 	waitToolEnabled?: boolean;
+	waitToolDefaultTimeoutMs?: number;
 	worktreeBaseDir?: string;
 	asyncDir: string;
 	outputBaseDir?: string;
@@ -558,9 +563,8 @@ function spawnRunner(cfg: object, suffix: string, cwd: string, initialStatus: Om
 		}
 		const proc = spawn(nodeCommand, [jitiCliPath, runner, cfgPath], {
 			cwd,
-			detached: true,
+			...backgroundProcessOptions(),
 			stdio: ["ignore", stdoutFd ?? "ignore", stderrFd ?? "ignore"],
-			windowsHide: true,
 			env: {
 				...omitExtensionBindingsEnv(process.env),
 				...(piPackageRoot ? { [PI_CODING_AGENT_PACKAGE_ROOT_ENV]: piPackageRoot } : {}),
@@ -804,19 +808,21 @@ export function buildAsyncRunnerSteps(id: string, params: AsyncRunnerStepBuildPa
 			envValue: params.toolTimeoutMsEnv ?? toolTimeoutFromEnv(),
 		});
 		if (resolvedToolTimeout.error) throw new AsyncStartValidationError(resolvedToolTimeout.error);
-		const stepCwd = resolveChildCwd(runnerCwd, s.cwd);
-		const instructionCwd = behaviorCwd ?? stepCwd;
-		const readExistenceCwd = behaviorCwd ? stepCwd : instructionCwd;
-		let behavior = suppressProgressForReadOnlyTask(resolvedBehavior ?? resolveStepBehavior(a, buildStepOverrides(s), chainSkills), s.task, originalTask);
-		const inheritedRelativeParallelOutput = parallelOutputNamespace && s.output === undefined && typeof behavior.output === "string" && !path.isAbsolute(behavior.output);
-		if (inheritedRelativeParallelOutput && parallelOutputNamespace.taskIndex !== undefined) {
-			behavior = {
-				...behavior,
-				output: path.join(`parallel-${parallelOutputNamespace.stepIndex}`, `${parallelOutputNamespace.taskIndex}-${s.agent}`, behavior.output as string),
-			};
-		}
-		const namespaceOutputPath = Boolean(inheritedRelativeParallelOutput && parallelOutputNamespace.taskIndex === undefined);
-		const skillNames = behavior.skills === false ? [] : behavior.skills;
+		const launchPlan = planChildLaunch({
+			agentConfig: a,
+			stepOverrides: buildStepOverrides(s),
+			task: s.task,
+			originalTask,
+			runnerCwd,
+			runtimeCwd: ctx.cwd,
+			stepCwdInput: s.cwd,
+			behaviorCwd,
+			chainSkills,
+			outputBaseDir,
+			parallelOutputNamespace,
+			resolvedBehavior,
+		});
+		const { stepCwd, instructionCwd, readExistenceCwd, behavior, namespaceOutputPath, outputPath, skillNames } = launchPlan;
 		const { resolved: resolvedSkills, missing: missingSkills } = resolveSkillsWithFallback(
 			skillNames,
 			stepCwd,
@@ -841,7 +847,6 @@ export function buildAsyncRunnerSteps(id: string, params: AsyncRunnerStepBuildPa
 		const isFirstProgressAgent = behavior.progress && !progressPrecreated && !progressInstructionCreated;
 		if (behavior.progress) progressInstructionCreated = true;
 		const progressInstructions = buildChainInstructions({ ...behavior, output: false, reads: false }, progressDir, isFirstProgressAgent);
-		const outputPath = resolveSingleOutputPath(behavior.output, ctx.cwd, instructionCwd, outputBaseDir);
 		if (!namespaceOutputPath) systemPrompt = injectOutputPathSystemPrompt(systemPrompt, outputPath, a);
 		const validationError = validateFileOnlyOutputMode(behavior.outputMode, outputPath, `Async step (${s.agent})`);
 		if (validationError) throw new AsyncStartValidationError(validationError);
@@ -896,6 +901,7 @@ export function buildAsyncRunnerSteps(id: string, params: AsyncRunnerStepBuildPa
 		const fast = s.fast ?? params.fast ?? a.fast;
 		const toolPlan = resolvePiLaunchToolPlan({
 			tools: a.tools,
+			allowNestedSubagents: a.allowNestedSubagents,
 			extensions: a.extensions,
 			subagentOnlyExtensions: a.subagentOnlyExtensions,
 			mcpDirectTools: a.mcpDirectTools,
@@ -957,6 +963,7 @@ export function buildAsyncRunnerSteps(id: string, params: AsyncRunnerStepBuildPa
 			...(primaryModelFromParent ? { skipPrimaryModelVerification: true } : {}),
 			...(availableModels && availableModels.length > 0 ? { modelVerificationRegistry: availableModels } : {}),
 			tools: a.tools,
+			allowNestedSubagents: a.allowNestedSubagents,
 			extensions: a.extensions,
 			subagentOnlyExtensions: a.subagentOnlyExtensions,
 			mcpDirectTools: a.mcpDirectTools,
@@ -976,6 +983,7 @@ export function buildAsyncRunnerSteps(id: string, params: AsyncRunnerStepBuildPa
 			timeoutMs: a.defaultTimeoutMs ?? DEFAULT_ASYNC_TIMEOUT_MS,
 			toolTimeoutMs: resolvedToolTimeout.toolTimeoutMs,
 			waitToolEnabled: params.waitToolEnabled,
+			waitToolDefaultTimeoutMs: params.waitToolDefaultTimeoutMs,
 			effectiveAcceptance: resolveEffectiveAcceptance({
 				explicit: s.acceptance,
 				agentName: s.agent,
@@ -1203,6 +1211,7 @@ export function executeAsyncChain(
 		dynamicFanoutMaxItems: params.dynamicFanoutMaxItems,
 		maxSubagentDepth,
 		waitToolEnabled: params.waitToolEnabled,
+		waitToolDefaultTimeoutMs: params.waitToolDefaultTimeoutMs,
 		worktreeBaseDir,
 		asyncDir,
 		fast: params.fast,
@@ -1224,7 +1233,6 @@ export function executeAsyncChain(
 	}
 	const { steps, runnerCwd, workflowGraph, eventChain } = built;
 	const deadlineAt = params.timeoutMs !== undefined ? Date.now() + params.timeoutMs : undefined;
-	const initialTurnBudget = params.turnBudget ? initialTurnBudgetState(params.turnBudget) : undefined;
 	const initialUsageBudget = usageBudgetState(params.usageBudget, undefined);
 	let childTargetIndex = 0;
 	const childIntercomTargets = childIntercomTarget ? steps.flatMap((step) => {
@@ -1281,7 +1289,6 @@ export function executeAsyncChain(
 				worktreeSetupHookTimeoutMs,
 				worktreeBaseDir,
 				controlConfig,
-				turnBudget: params.turnBudget,
 				toolBudget: params.toolBudget,
 				usageBudget: params.usageBudget,
 				controlIntercomTarget,
@@ -1400,7 +1407,6 @@ export function executeAsyncChain(
 						chainStepCount: eventChain.length,
 						parallelGroups,
 						...(params.timeoutMs !== undefined ? { timeoutMs: params.timeoutMs, deadlineAt } : {}),
-						...(initialTurnBudget ? { turnBudget: initialTurnBudget } : {}),
 						startedAt: now,
 						lastUpdate: now,
 						...(capabilityCeiling ? { capabilityCeiling } : {}),
@@ -1431,7 +1437,6 @@ export function executeAsyncChain(
 			asyncDir,
 			...(sessionRoot ? { sessionRoot } : {}),
 			...(params.timeoutMs !== undefined ? { timeoutMs: params.timeoutMs, deadlineAt } : {}),
-			...(initialTurnBudget ? { turnBudget: initialTurnBudget } : {}),
 			...(initialUsageBudget ? { usageBudget: initialUsageBudget } : {}),
 			...(capabilityCeiling ? { capabilityCeiling } : {}),
 			...(params.parentWorkflowRunId ? { parentWorkflowRunId: params.parentWorkflowRunId } : {}),
@@ -1448,7 +1453,7 @@ export function executeAsyncChain(
 
 	return {
 		content: [{ type: "text", text: formatAsyncStartedMessage(`Async ${resultMode}: ${chainDesc} [${id}]`, ctx.interactive === true) }],
-		details: { mode: resultMode, runId: id, results: [], asyncId: id, asyncDir, workflowGraph, ...(capabilityCeiling ? { capabilityCeiling } : {}), ...(params.parentWorkflowRunId ? { parentWorkflowRunId: params.parentWorkflowRunId } : {}), ...(params.workflowKey ? { workflowKey: params.workflowKey } : {}), ...(params.timeoutMs !== undefined ? { timeoutMs: params.timeoutMs, deadlineAt } : {}), ...(params.turnBudget ? { turnBudget: params.turnBudget } : {}), ...(params.toolBudget ? { toolBudget: params.toolBudget } : {}), ...(initialUsageBudget ? { usageBudget: initialUsageBudget } : {}) },
+		details: { mode: resultMode, runId: id, results: [], asyncId: id, asyncDir, workflowGraph, ...(capabilityCeiling ? { capabilityCeiling } : {}), ...(params.parentWorkflowRunId ? { parentWorkflowRunId: params.parentWorkflowRunId } : {}), ...(params.workflowKey ? { workflowKey: params.workflowKey } : {}), ...(params.timeoutMs !== undefined ? { timeoutMs: params.timeoutMs, deadlineAt } : {}), ...(params.toolBudget ? { toolBudget: params.toolBudget } : {}), ...(initialUsageBudget ? { usageBudget: initialUsageBudget } : {}) },
 	};
 }
 
@@ -1483,6 +1488,13 @@ export function executeAsyncSingle(
 		childIntercomTarget,
 		nestedRoute,
 	} = params;
+	let lane: WorkflowLaneMetadata | undefined;
+	try {
+		lane = normalizeWorkflowLaneMetadata(params.lane, "lane");
+		assertWorkflowLaneKey(lane, params.workflowKey, "lane");
+	} catch (error) {
+		return formatAsyncStartError("single", error instanceof Error ? error.message : String(error));
+	}
 	const task = params.task ?? "";
 	let extensionBindings: ExtensionBindings | undefined;
 	try {
@@ -1616,7 +1628,6 @@ export function executeAsyncSingle(
 	});
 	if (resolvedToolTimeout.error) return formatAsyncStartError("single", resolvedToolTimeout.error);
 	const toolTimeoutMs = resolvedToolTimeout.toolTimeoutMs;
-	const initialTurnBudget = params.turnBudget ? initialTurnBudgetState(params.turnBudget) : undefined;
 	const initialUsageBudget = usageBudgetState(params.usageBudget, undefined);
 	const resolvedSessionDir = params.sessionDir ?? (sessionRoot ? path.join(sessionRoot, `async-${id}`) : undefined);
 	const structuredOutput = params.structuredOutputSchema
@@ -1639,9 +1650,9 @@ export function executeAsyncSingle(
 			return formatAsyncStartError("single", error instanceof Error ? error.message : String(error));
 		}
 	}
-	const effectiveSystemPrompt = appendTurnBudgetSystemPrompt(systemPrompt, params.turnBudget);
 	const toolPlan = resolvePiLaunchToolPlan({
 		tools: agentConfig.tools,
+		allowNestedSubagents: agentConfig.allowNestedSubagents,
 		extensions: agentConfig.extensions,
 		subagentOnlyExtensions: agentConfig.subagentOnlyExtensions,
 		mcpDirectTools: agentConfig.mcpDirectTools,
@@ -1680,7 +1691,7 @@ export function executeAsyncSingle(
 		...((params.fast ?? agentConfig.fast) !== undefined ? { fast: params.fast ?? agentConfig.fast } : {}),
 		...(resolveEffectiveThinking(model, effectiveThinking) ? { thinking: resolveEffectiveThinking(model, effectiveThinking) } : {}),
 		...(thinkingCeiling ? { thinkingCeiling } : {}),
-		systemPrompt: effectiveSystemPrompt,
+		systemPrompt,
 		systemPromptMode: agentConfig.systemPromptMode,
 		inheritProjectContext: agentConfig.inheritProjectContext,
 		inheritGlobalContext: agentConfig.inheritGlobalContext,
@@ -1706,6 +1717,7 @@ export function executeAsyncSingle(
 	const recoveryAgentConfig = params.recoveryAgentConfig ?? agentConfig;
 	const recoveryDescriptor: SteeringRecoveryDescriptor = {
 		version: 1,
+		...(lane ? { lane } : {}),
 		launchContractDigest,
 		...(extensionBindings ? { extensionBindings } : {}),
 		runFanoutBudget,
@@ -1723,6 +1735,7 @@ export function executeAsyncSingle(
 		...(effectiveThinking ? { thinking: resolveEffectiveThinking(model, effectiveThinking) } : {}),
 		...(thinkingCeiling ? { thinkingCeiling } : {}),
 		...(recoveryAgentConfig.tools ? { tools: [...recoveryAgentConfig.tools] } : {}),
+		...(recoveryAgentConfig.allowNestedSubagents !== undefined ? { allowNestedSubagents: recoveryAgentConfig.allowNestedSubagents } : {}),
 		...(recoveryAgentConfig.extensions ? { extensions: [...recoveryAgentConfig.extensions] } : {}),
 		...(recoveryAgentConfig.subagentOnlyExtensions ? { subagentOnlyExtensions: [...recoveryAgentConfig.subagentOnlyExtensions] } : {}),
 		...(recoveryAgentConfig.mcpDirectTools ? { mcpDirectTools: [...recoveryAgentConfig.mcpDirectTools] } : {}),
@@ -1745,7 +1758,6 @@ export function executeAsyncSingle(
 		...(params.context ? { context: params.context } : {}),
 		...(params.intercomBridge !== undefined ? { intercomBridge: params.intercomBridge } : {}),
 		...(deadlineAt !== undefined ? { absoluteDeadlineAt: deadlineAt } : {}),
-		...(initialTurnBudget ? { initialTurnBudget: { maxTurns: initialTurnBudget.maxTurns, graceTurns: initialTurnBudget.graceTurns } } : {}),
 		...(resolvedToolBudget.budget ? { initialToolBudget: resolvedToolBudget.budget } : {}),
 		maxSubagentDepth: resolveChildMaxSubagentDepth(maxSubagentDepth, recoveryAgentConfig.maxSubagentDepth),
 		...(maxOutput ? { maxOutput } : {}),
@@ -1790,6 +1802,7 @@ export function executeAsyncSingle(
 						...(params.modelOverrideFromParent ? { skipPrimaryModelVerification: true } : {}),
 						...(availableModels && availableModels.length > 0 ? { modelVerificationRegistry: availableModels } : {}),
 						tools: agentConfig.tools,
+						allowNestedSubagents: agentConfig.allowNestedSubagents,
 						extensions: agentConfig.extensions,
 						subagentOnlyExtensions: agentConfig.subagentOnlyExtensions,
 						mcpDirectTools: agentConfig.mcpDirectTools,
@@ -1804,10 +1817,12 @@ export function executeAsyncSingle(
 						inheritSkills: agentConfig.inheritSkills,
 						skills: resolvedSkills.map((r) => r.name),
 						outputPath,
+						...(params.outputClaimPath ? { outputClaimPath: params.outputClaimPath } : {}),
 						outputMode,
 						...(!externalRunner && sessionFile ? { sessionFile } : {}),
 						maxSubagentDepth: resolveChildMaxSubagentDepth(maxSubagentDepth, agentConfig.maxSubagentDepth),
 						waitToolEnabled: params.waitToolEnabled,
+						waitToolDefaultTimeoutMs: params.waitToolDefaultTimeoutMs,
 						...(params.agentContract ? { agentContract: params.agentContract } : {}),
 						definitionDigest: agentDefinitionDigest(agentConfig),
 						launchBindingTask: task,
@@ -1819,6 +1834,7 @@ export function executeAsyncSingle(
 						...(params.structuredOutputSchema ? { structuredOutputSchema: params.structuredOutputSchema } : {}),
 						...(resolvedToolBudget.budget ? { toolBudget: resolvedToolBudget.budget } : {}),
 						...(params.worktree === true ? { worktree: true } : {}),
+						...(lane ? { lane } : {}),
 					},
 				],
 				resultPath: params.parentWorkflowRunId !== undefined && (params.revivalLease !== undefined || params.workflowAwaitAsync === true)
@@ -1844,7 +1860,6 @@ export function executeAsyncSingle(
 				timeoutMs,
 				deadlineAt,
 				toolTimeoutMs,
-				turnBudget: params.turnBudget,
 				toolBudget: params.toolBudget,
 				usageBudget: params.usageBudget,
 				controlIntercomTarget,
@@ -1855,6 +1870,7 @@ export function executeAsyncSingle(
 				runFanoutBudget,
 				...(params.parentWorkflowRunId ? { parentWorkflowRunId: params.parentWorkflowRunId } : {}),
 				...(params.workflowKey ? { workflowKey: params.workflowKey } : {}),
+				...(lane ? { lane } : {}),
 				...(params.revivalLease ? { revivalLease: params.revivalLease } : {}),
 				nestedRoute: nestedRoute ?? inheritedNestedRoute,
 				nestedSelf: inheritedNestedRoute && nestedAddress ? {
@@ -1877,7 +1893,8 @@ export function executeAsyncSingle(
 				lastUpdate: initialStatusAt,
 				currentStep: 0,
 				chainStepCount: 1,
-				steps: [{ agent, status: "pending", ...(model ? { model } : {}), ...(contextLimit !== undefined ? { contextLimit } : {}) }],
+				...(lane ? { lane } : {}),
+				steps: [{ agent, status: "pending", ...(lane ? { lane } : {}), ...(model ? { model } : {}), ...(contextLimit !== undefined ? { contextLimit } : {}) }],
 			},
 			path.join(asyncDir, "status.json"),
 			(proof) => emitProcessTerminalEvent(ctx, proof),
@@ -1927,7 +1944,6 @@ export function executeAsyncSingle(
 						agents: [agent],
 						chainStepCount: 1,
 						...(timeoutMs !== undefined ? { timeoutMs, deadlineAt } : {}),
-						...(initialTurnBudget ? { turnBudget: initialTurnBudget } : {}),
 						startedAt: now,
 						lastUpdate: now,
 						...(capabilityCeiling ? { capabilityCeiling } : {}),
@@ -1955,7 +1971,6 @@ export function executeAsyncSingle(
 			...(params.parentWorkflowRunId ? { parentWorkflowRunId: params.parentWorkflowRunId } : {}),
 			...(params.workflowKey ? { workflowKey: params.workflowKey } : {}),
 			...(timeoutMs !== undefined ? { timeoutMs, deadlineAt } : {}),
-			...(initialTurnBudget ? { turnBudget: initialTurnBudget } : {}),
 			...(initialUsageBudget ? { usageBudget: initialUsageBudget } : {}),
 			...(capabilityCeiling ? { capabilityCeiling } : {}),
 			nestedRoute,
@@ -1964,6 +1979,6 @@ export function executeAsyncSingle(
 
 	return {
 		content: [{ type: "text", text: formatAsyncStartedMessage(`Async: ${agent} [${id}]`, ctx.interactive === true) }],
-		details: { mode: "single", runId: id, results: [], asyncId: id, asyncDir, launchContractDigest, launchResolvedExtensions, ...(capabilityCeiling ? { capabilityCeiling } : {}), ...(params.context ? { context: params.context } : {}), ...(timeoutMs !== undefined ? { timeoutMs, deadlineAt } : {}), ...(params.turnBudget ? { turnBudget: params.turnBudget } : {}), ...(params.toolBudget ? { toolBudget: resolvedToolBudget.budget ?? params.toolBudget } : {}), ...(initialUsageBudget ? { usageBudget: initialUsageBudget } : {}) } as Details,
+		details: { mode: "single", runId: id, results: [], asyncId: id, asyncDir, launchContractDigest, launchResolvedExtensions, ...(capabilityCeiling ? { capabilityCeiling } : {}), ...(params.context ? { context: params.context } : {}), ...(timeoutMs !== undefined ? { timeoutMs, deadlineAt } : {}), ...(params.toolBudget ? { toolBudget: resolvedToolBudget.budget ?? params.toolBudget } : {}), ...(initialUsageBudget ? { usageBudget: initialUsageBudget } : {}) } as Details,
 	};
 }

@@ -72,8 +72,13 @@ test("L0-6: 载体面插桩保持（fleetView/asyncWidget/slash 经 host caps �
   );
   assert.match(
     source,
-    /if \(resolveHostCaps\(\)\.slash\) \{\n\t\tregisterSlashCommands/,
-    "插桩丢失：registerSlashCommands 应受 host caps 门控",
+    /const disposeSlashCommands = resolveHostCaps\(\)\.slash\n\t\t\? registerSlashCommands/,
+    "插桩丢失：registerSlashCommands 应受 host caps 门控（0.59.0 起三元提升 dispose 作用域）",
+  );
+  assert.match(
+    source,
+    /: \{ dispose\(\) \{\} \};/,
+    "插桩丢失：slash 关闭时应有 no-op dispose 兜底（上游清理链无条件调用）",
   );
 });
 

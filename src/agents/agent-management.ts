@@ -31,11 +31,11 @@ import { parseFrontmatter, parseFrontmatterList } from "./frontmatter.ts";
 import { toModelInfo } from "../shared/model-info.ts";
 import { resolveSubagentModelOverride, type ParentModel } from "../runs/shared/model-fallback.ts";
 import { validateToolBudgetConfig } from "../runs/shared/tool-budget.ts";
-import { resolveTurnBudgetConfig } from "../runs/shared/turn-budget.ts";
 import { validateAcceptanceInput } from "../runs/shared/acceptance.ts";
-import { CODE_OWNED_EXTERNAL_CLI_ADAPTER_LABEL, isCodeOwnedExternalCliAdapterId, validateCodeOwnedProfileRunner } from "../runs/shared/external-cli-contract.ts";
-import type { AcceptanceInput, Details, ExtensionConfig, ToolBudgetConfig } from "../shared/types.ts";
+import { CODE_OWNED_EXTERNAL_CLI_ADAPTER_LABEL, isCodeOwnedExternalCliAdapterId, resolveExternalCliRunnerStatus, validateCodeOwnedProfileRunner } from "../runs/shared/external-cli-contract.ts";
+import type { AcceptanceInput, AgentCapabilitiesSnapshot, AgentCapabilityRow, Details, ExtensionConfig, ToolBudgetConfig } from "../shared/types.ts";
 import { getProjectConfigDir } from "../shared/utils.ts";
+import { previewDisplayText } from "../shared/display-text.ts";
 import { capabilityCeilingAgentRestrictionSources, isAgentAllowedByCapabilityCeiling, resolveCurrentSubagentCapabilityCeiling } from "../runs/shared/capability-ceiling.ts";
 import { listRuntimeAgentConfigs, mergeRuntimeAgents, type RuntimeAgentOwner } from "./runtime-agent-registry.ts";
 import { listExternalJobProviders } from "../api/external-job-provider.ts";
@@ -48,11 +48,21 @@ interface ManagementParams {
 	action?: string;
 	agent?: string;
 	agentScope?: unknown;
+	capabilities?: unknown;
 	config?: unknown;
 }
 
-function result(text: string, isError = false): AgentToolResult<Details> {
-	return { content: [{ type: "text", text }], isError, details: { mode: "management", results: [] } };
+function result(text: string, isError = false, details?: Partial<Details>): AgentToolResult<Details> {
+	return { content: [{ type: "text", text }], isError, details: { mode: "management", results: [], ...details } };
+}
+
+function jsonDetails<T>(value: T): T {
+	return JSON.parse(JSON.stringify(value)) as T;
+}
+
+function presentDetails<T extends Record<string, unknown>>(value: T): T | undefined {
+	const cleaned = jsonDetails(value);
+	return Object.keys(cleaned).length > 0 ? cleaned : undefined;
 }
 
 function parseCsv(value: string): string[] {
@@ -331,7 +341,6 @@ export function preservedAgentFrontmatterFields(agent: AgentConfig, cfg: Record<
 	if (hasKey(cfg, "defaultContext")) changed("defaultContext");
 	if (hasKey(cfg, "async")) changed("async");
 	if (hasKey(cfg, "timeoutMs")) changed("timeoutMs");
-	if (hasKey(cfg, "turnBudget")) changed("turnBudget");
 	if (hasKey(cfg, "acceptance")) changed("acceptance");
 	if (hasKey(cfg, "acceptanceRole")) changed("acceptanceRole");
 	if (hasKey(cfg, "output")) changed("output");
@@ -511,15 +520,6 @@ function applyAgentConfig(target: AgentConfig, cfg: Record<string, unknown>): st
 		else if (typeof cfg.timeoutMs === "number" && Number.isInteger(cfg.timeoutMs) && cfg.timeoutMs > 0) target.defaultTimeoutMs = cfg.timeoutMs;
 		else return "config.timeoutMs must be a positive integer or false when provided.";
 	}
-	if (hasKey(cfg, "turnBudget")) {
-		if (cfg.turnBudget === false || cfg.turnBudget === "") delete target.defaultTurnBudget;
-		else {
-			const resolved = resolveTurnBudgetConfig(cfg.turnBudget, "config.turnBudget");
-			if (resolved.error) return resolved.error;
-			if (resolved.turnBudget !== undefined) target.defaultTurnBudget = resolved.turnBudget;
-			else delete target.defaultTurnBudget;
-		}
-	}
 	if (hasKey(cfg, "acceptance")) {
 		if (cfg.acceptance === "") delete target.defaultAcceptance;
 		else {
@@ -656,18 +656,135 @@ function runnerListBadge(agent: AgentConfig, providerNames: Set<string> | undefi
 	return undefined;
 }
 
-function formatAgentListLine(agent: AgentConfig, providerNames: Set<string> | undefined): string {
+function agentListMetadata(agent: AgentConfig, providerNames: Set<string> | undefined): string {
 	const source = agent.source === "package" ? packageSourceLabel(agent) : agent.source;
-	const parts = [
+	return [
 		source,
 		runnerListBadge(agent, providerNames),
 		agent.defaultContext ? `context: ${agent.defaultContext}` : undefined,
 		agent.aliases?.length ? `aliases: ${agent.aliases.join(", ")}` : undefined,
-	].filter((part): part is string => Boolean(part));
-	return `- ${agent.name} (${parts.join(", ")}): ${agent.description}`;
+	].filter((part): part is string => Boolean(part)).join(", ");
 }
 
-function formatAgentListSections(agents: AgentConfig[], providerNames: Set<string> | undefined): string[] {
+function formatAgentListLine(agent: AgentConfig, providerNames: Set<string> | undefined): string {
+	return `- ${agent.name} (${agentListMetadata(agent, providerNames)}): ${agent.description}`;
+}
+
+function formatAgentCapabilitiesLine(agent: AgentConfig, providerNames: Set<string> | undefined): string {
+	const declaredTools = [
+		...(agent.tools ?? []),
+		...(agent.mcpDirectTools ?? []).map((tool) => `mcp:${tool}`),
+	];
+	let tools = "none";
+	if (agent.tools === undefined && agent.mcpDirectTools === undefined) {
+		tools = "default/ambient";
+	} else if (declaredTools.length > 0) {
+		tools = declaredTools.join(", ");
+	}
+	let model = "inherits current session";
+	if (agent.model !== undefined) {
+		model = agent.model;
+		if (agent.modelProvider && !agent.model.includes("/")) model = `${agent.modelProvider}/${agent.model}`;
+	}
+	const thinking = agent.thinking === false ? "off" : agent.thinking ?? "default";
+	return `- ${agent.name} (${agentListMetadata(agent, providerNames)}): Description: ${previewDisplayText(agent.description, 240)}; Tools: ${tools}; Model: ${model}; Thinking: ${thinking}`;
+}
+
+const EXTERNAL_JOB_CAPABILITIES = { stop: false, steer: false, resume: false, structuredOutput: false, toolEvents: false } as const;
+const PI_AGENT_RUNNER = { type: "pi" } as const;
+
+function listOrEmpty<T>(values: T[] | undefined): T[] {
+	return values ?? [];
+}
+
+function agentCapabilityRunner(agent: AgentConfig, providerNames: Set<string> | undefined): AgentCapabilityRow["runner"] {
+	const runner = agent.runner;
+	if (!runner || runner.type === "pi") return PI_AGENT_RUNNER;
+	if (runner.type === "external-cli") return { type: "external-cli", adapter: runner.adapter, capabilities: resolveExternalCliRunnerStatus(runner).capabilities };
+	return { type: "external-job", provider: runner.provider, available: providerNames?.has(runner.provider), capabilities: EXTERNAL_JOB_CAPABILITIES };
+}
+
+function agentCapabilityTools(agent: AgentConfig): AgentCapabilityRow["tools"] {
+	return {
+		ambient: agent.tools === undefined && agent.mcpDirectTools === undefined,
+		names: listOrEmpty(agent.tools),
+		mcpDirectTools: listOrEmpty(agent.mcpDirectTools),
+		mutationTools: agent.mutationTools,
+	};
+}
+
+function agentCapabilityRow(agent: AgentConfig, options: { executable: boolean; providerNames?: Set<string>; restrictionSources?: string[] }): AgentCapabilityRow {
+	return {
+		name: agent.name,
+		description: previewDisplayText(agent.description, 1000),
+		source: agent.source,
+		executable: options.executable,
+		restrictionSources: options.executable ? undefined : options.restrictionSources ?? [],
+		aliases: agent.aliases ? [...agent.aliases] : undefined,
+		runner: agentCapabilityRunner(agent, options.providerNames),
+		tools: agentCapabilityTools(agent),
+		model: presentDetails({ value: agent.model, fallbackModels: agent.fallbackModels, thinking: agent.thinking }),
+		execution: presentDetails({ defaultAsync: agent.defaultAsync, timeoutMs: agent.defaultTimeoutMs }),
+		output: presentDetails({ path: agent.output, mode: agent.outputMode }),
+		extensions: presentDetails({ names: agent.extensions, subagentOnly: agent.subagentOnlyExtensions, skills: agent.skills }),
+	};
+}
+
+function agentCapabilitiesSnapshot(input: { agents: AgentConfig[]; restrictedAgents: AgentConfig[]; providerNames?: Set<string>; restrictedSources?: string[] }): AgentCapabilitiesSnapshot {
+	return {
+		agents: [
+			...input.agents.map((agent) => agentCapabilityRow(agent, { executable: true, providerNames: input.providerNames })),
+			...input.restrictedAgents.map((agent) => agentCapabilityRow(agent, { executable: false, providerNames: input.providerNames, restrictionSources: input.restrictedSources })),
+		],
+		restrictedCount: input.restrictedAgents.length,
+		...(input.restrictedSources?.length ? { capabilityCeilingSources: [...input.restrictedSources] } : {}),
+	};
+}
+
+function providerNames(status: ExternalJobProviderStatus): Set<string> | undefined {
+	return status.ok ? status.names : undefined;
+}
+
+function appendRestrictedAgentLines(input: { lines: string[]; agents: AgentConfig[]; sources?: string[]; providerNames?: Set<string>; formatLine: (agent: AgentConfig, providerNames: Set<string> | undefined) => string }): void {
+	if (input.agents.length === 0) return;
+	input.lines.push(
+		"",
+		`Restricted agents (not executable in this session${input.sources?.length ? `; capability ceiling: ${input.sources.join(", ")}` : ""}):`,
+		...input.agents.map((agent) => input.formatLine(agent, input.providerNames)),
+	);
+}
+
+function appendExternalJobRegistryLine(lines: string[], agents: AgentConfig[], status: ExternalJobProviderStatus): void {
+	if (status.ok || !agents.some((agent) => agent.runner?.type === "external-job")) return;
+	lines.push("", `External-job provider registry unavailable: ${status.error}`);
+}
+
+function appendAgentDiagnosticLines(lines: string[], diagnostics: AgentDiscoveryDiagnostic[] | undefined): void {
+	if (!diagnostics?.length) return;
+	lines.push(
+		"",
+		"Invalid agent definitions:",
+		...diagnostics.map((diagnostic) => `- ${diagnostic.name ?? diagnostic.filePath} (${diagnostic.source}): ${diagnostic.error}`),
+	);
+}
+
+function agentCapabilityDetails(input: { capabilityMode: boolean; agents: AgentConfig[]; restrictedAgents: AgentConfig[]; providerNames?: Set<string>; restrictedSources?: string[] }): Partial<Details> | undefined {
+	if (!input.capabilityMode) return undefined;
+	return {
+		agentCapabilities: jsonDetails(agentCapabilitiesSnapshot({
+			agents: input.agents,
+			restrictedAgents: input.restrictedAgents,
+			providerNames: input.providerNames,
+			restrictedSources: input.restrictedSources,
+		})),
+	};
+}
+
+function formatAgentListSections(
+	agents: AgentConfig[],
+	providerNames: Set<string> | undefined,
+	formatLine: (agent: AgentConfig, providerNames: Set<string> | undefined) => string = formatAgentListLine,
+): string[] {
 	if (agents.length === 0) return ["- (none)"];
 	const sections: Array<[AgentSource, string]> = [
 		["package", "Package agents"],
@@ -681,7 +798,7 @@ function formatAgentListSections(agents: AgentConfig[], providerNames: Set<strin
 		const matches = agents.filter((agent) => agent.source === source);
 		if (matches.length === 0) continue;
 		if (lines.length > 0) lines.push("");
-		lines.push(label, ...matches.map((agent) => formatAgentListLine(agent, providerNames)));
+		lines.push(label, ...matches.map((agent) => formatLine(agent, providerNames)));
 	}
 	return lines;
 }
@@ -724,7 +841,6 @@ function formatAgentDetail(agent: AgentConfig): string {
 	if (agent.defaultContext) lines.push(`Default context: ${agent.defaultContext}`);
 	if (agent.defaultAsync !== undefined) lines.push(`Async: ${agent.defaultAsync ? "true" : "false"}`);
 	if (agent.defaultTimeoutMs !== undefined) lines.push(`Timeout: ${agent.defaultTimeoutMs}ms`);
-	if (agent.defaultTurnBudget) lines.push(`Turn budget: ${JSON.stringify(agent.defaultTurnBudget)}`);
 	if (agent.defaultAcceptance !== undefined) lines.push(`Acceptance: ${typeof agent.defaultAcceptance === "object" ? JSON.stringify(agent.defaultAcceptance) : String(agent.defaultAcceptance)}`);
 	if (agent.acceptanceRole) lines.push(`Acceptance role: ${agent.acceptanceRole}`);
 	if (agent.source === "builtin") lines.push(`Disabled: ${agent.disabled ? "true" : "false"}`);
@@ -746,7 +862,7 @@ function formatAgentDetail(agent: AgentConfig): string {
 
 export function handleList(params: ManagementParams, ctx: ManagementContext): AgentToolResult<Details> {
 	const scope = normalizeListScope(params.agentScope) ?? "both";
-	const d = discoverAgentsAll(ctx.cwd);
+	const d = discoverAgentsAll(ctx.cwd, ctx.model?.provider);
 	let scopedAgents = mergeAgentsForScope(scope, d.user, d.project, d.builtin, d.package);
 	if (ctx.runtimeAgentOwner && listRuntimeAgentConfigs(ctx.runtimeAgentOwner).length > 0) {
 		const configuredAgents: AgentConfig[] = [
@@ -770,23 +886,24 @@ export function handleList(params: ManagementParams, ctx: ManagementContext): Ag
 		discoverAvailableSkills: () => discoverAvailableSkills(ctx.cwd),
 	});
 	const providerStatus = registeredExternalJobProviderStatus();
+	const providerNameSet = providerNames(providerStatus);
+	const capabilityMode = params.capabilities === true;
+	const formatLine = capabilityMode ? formatAgentCapabilitiesLine : formatAgentListLine;
 	const lines = [
-		"Executable agents:",
-		...formatAgentListSections(agents, providerStatus.ok ? providerStatus.names : undefined),
-		...(restrictedAgents.length ? [
-			"",
-			`Restricted agents (not executable in this session${restrictedSources?.length ? `; capability ceiling: ${restrictedSources.join(", ")}` : ""}):`,
-			...restrictedAgents.map((a) => formatAgentListLine(a, providerStatus.ok ? providerStatus.names : undefined)),
-		] : []),
-		...(!providerStatus.ok && [...agents, ...restrictedAgents].some((agent) => agent.runner?.type === "external-job") ? ["", `External-job provider registry unavailable: ${providerStatus.error}`] : []),
-		...(d.agentDiagnostics?.length ? [
-			"",
-			"Invalid agent definitions:",
-			...d.agentDiagnostics.map((diagnostic) => `- ${diagnostic.name ?? diagnostic.filePath} (${diagnostic.source}): ${diagnostic.error}`),
-		] : []),
-		...(proactiveSuggestions.length ? ["", ...proactiveSuggestions] : []),
+		capabilityMode ? "Executable agents (capabilities):" : "Executable agents:",
+		...formatAgentListSections(agents, providerNameSet, formatLine),
 	];
-	return result(lines.join("\n"));
+	appendRestrictedAgentLines({ lines, agents: restrictedAgents, sources: restrictedSources, providerNames: providerNameSet, formatLine });
+	appendExternalJobRegistryLine(lines, [...agents, ...restrictedAgents], providerStatus);
+	appendAgentDiagnosticLines(lines, d.agentDiagnostics);
+	if (proactiveSuggestions.length) lines.push("", ...proactiveSuggestions);
+	return result(lines.join("\n"), false, agentCapabilityDetails({
+		capabilityMode,
+		agents,
+		restrictedAgents,
+		providerNames: providerNameSet,
+		restrictedSources,
+	}));
 }
 
 function formatModelSource(agent: AgentConfig, currentModel: ParentModel | undefined): string {
@@ -807,7 +924,7 @@ function handleModels(params: ManagementParams, ctx: ManagementContext): AgentTo
 		return result(`Builtin agent '${requestedAgent}' not found. Available: ${BUILTIN_AGENT_NAMES.join(", ")}.`, true);
 	}
 
-	const discovered = discoverAgentsAll(ctx.cwd);
+	const discovered = discoverAgentsAll(ctx.cwd, ctx.model?.provider);
 	const builtinByName = new Map(discovered.builtin.map((agent) => [agent.name, agent]));
 	const resolveBuiltinModelAgent = (name: string): AgentConfig | undefined => builtinByName.get(name) ?? resolveAgentName(name, discovered.builtin).agent;
 	const availableModels = ctx.modelRegistry.getAvailable().map(toModelInfo);
@@ -886,7 +1003,7 @@ function handleGet(params: ManagementParams, ctx: ManagementContext): AgentToolR
 	if (!params.agent) return result("Specify 'agent' for get.", true);
 	const scope = normalizeListScope(params.agentScope);
 	if (!scope) return result("agentScope must be 'user', 'project', or 'both' for get.", true);
-	const discovered = discoverAgentsAll(ctx.cwd);
+	const discovered = discoverAgentsAll(ctx.cwd, ctx.model?.provider);
 	const matches = findAgentsInDiscovery(params.agent, discovered, scope);
 	const diagnostics = diagnosticsForScope(discovered.agentDiagnostics, scope);
 	const rawName = params.agent.trim();
@@ -916,7 +1033,7 @@ export function handleCreate(params: ManagementParams, ctx: ManagementContext): 
 	const runtimeName = buildRuntimeName(name, parsedPackage.packageName);
 	const scopeRaw = cfg.scope ?? "user";
 	if (scopeRaw !== "user" && scopeRaw !== "project") return result("config.scope must be 'user' or 'project'.", true);
-	const scope = scopeRaw as ManagementScope;
+	const scope = scopeRaw;
 	if (hasKey(cfg, "steps")) return result("Durable chain definitions were removed; use workflowScript or /prompt-workflow for repeatable workflows.", true);
 	const d = discoverAgentsAll(ctx.cwd);
 	const projectConfigDir = getProjectConfigDir(ctx.cwd);
@@ -1164,7 +1281,7 @@ function handleReset(params: ManagementParams, ctx: ManagementContext): AgentToo
 }
 
 export function handleManagementAction(action: string, params: ManagementParams, ctx: ManagementContext): AgentToolResult<Details> {
-	switch (action as ManagementAction) {
+	switch (action) {
 		case "list": return handleList(params, ctx);
 		case "get": return handleGet(params, ctx);
 		case "models": return handleModels(params, ctx);

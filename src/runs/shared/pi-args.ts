@@ -48,7 +48,7 @@ import {
 	encodeChildWatchdogConfig,
 	type ChildWatchdogConfig,
 } from "../../watchdog/child-status.ts";
-import { WAIT_TOOL_ENABLED_ENV } from "../background/wait-config.ts";
+import { WAIT_TOOL_DEFAULT_TIMEOUT_MS_ENV, WAIT_TOOL_ENABLED_ENV } from "../background/wait-config.ts";
 import {
 	PI_CODING_AGENT_PACKAGE_ROOT_ENV,
 	getAgentDir,
@@ -117,6 +117,7 @@ const FAST_MODE_ALLOWED_MODELS = new Set([
 	"openai-codex/gpt-5.6-luna",
 	"openai-codex/gpt-5.6-sol",
 ]);
+const OPENAI_PROMPT_CACHE_KEY_MAX_LENGTH = 64;
 export const SUBAGENT_CHILD_ENV = "PI_SUBAGENT_CHILD";
 export const SUBAGENT_ORCHESTRATOR_TARGET_ENV =
 	"PI_SUBAGENT_ORCHESTRATOR_TARGET";
@@ -139,6 +140,7 @@ export const SUBAGENT_PARENT_PATH_ENV = "PI_SUBAGENT_PARENT_PATH";
 export const SUBAGENT_PARENT_CAPABILITY_TOKEN_ENV =
 	"PI_SUBAGENT_PARENT_CAPABILITY_TOKEN";
 export const SUBAGENT_PARENT_SESSION_ENV = "PI_SUBAGENT_PARENT_SESSION";
+export const SUBAGENT_FORK_CACHE_KEY_ENV = "PI_SUBAGENT_FORK_CACHE_KEY";
 export const SUBAGENT_STEER_INBOX_ENV = "PI_SUBAGENT_STEER_INBOX";
 export const SUBAGENT_STEER_CAPABILITY_ENV = "PI_SUBAGENT_STEER_CAPABILITY";
 export const SUBAGENT_STEER_ACK_DIR_ENV = "PI_SUBAGENT_STEER_ACK_DIR";
@@ -146,8 +148,16 @@ export const PI_INTERCOM_STABLE_ID_ENV = "PI_INTERCOM_STABLE_ID";
 export const PI_INTERCOM_SESSION_ID_ENV = "PI_INTERCOM_SESSION_ID";
 export const SUBAGENT_INHERIT_GLOBAL_CONTEXT_ENV = "PI_SUBAGENT_INHERIT_GLOBAL_CONTEXT";
 
+export function deriveForkPromptCacheKey(parentSessionId: string | undefined): string | undefined {
+	const parent = parentSessionId?.trim();
+	if (!parent) return undefined;
+	const digest = createHash("sha256").update(parent).digest("hex").slice(0, OPENAI_PROMPT_CACHE_KEY_MAX_LENGTH - "pi-fork:".length);
+	return `pi-fork:${digest}`;
+}
+
 export interface BuildPiArgsInput {
 	parentSessionId?: string;
+	forkCacheKey?: string;
 	baseArgs: string[];
 	task: string;
 	sessionEnabled: boolean;
@@ -170,6 +180,11 @@ export interface BuildPiArgsInput {
 	cwd?: string;
 	promptFileStem?: string;
 	intercomSessionName?: string;
+	/** Human-readable display name for the child session (agent + task excerpt,
+	 *  derived by the caller). Passed to the child as PI_SUBAGENT_SESSION_NAME;
+	 *  the prompt runtime applies it via pi.setSessionName unless an intercom
+	 *  target takes precedence. */
+	sessionName?: string;
 	orchestratorIntercomTarget?: string;
 	runId?: string;
 	childAgentName?: string;
@@ -206,6 +221,8 @@ export interface BuildPiArgsInput {
 	 */
 	taskDelivery?: SubagentTaskDelivery;
 	waitToolEnabled?: boolean;
+	waitToolDefaultTimeoutMs?: number;
+	allowNestedSubagents?: boolean;
 	capabilityCeiling?: ResolvedSubagentCapabilityCeiling;
 	thinkingCeiling?: import("../../shared/model-info.ts").ThinkingLevel;
 	extensionBindings?: ExtensionBindings;
@@ -283,6 +300,7 @@ function resolveFastModeExtension(input: Pick<ResolvePiLaunchToolPlanInput, "fas
 
 export interface ResolvePiLaunchToolPlanInput {
 	tools?: string[];
+	allowNestedSubagents?: boolean;
 	extensions?: string[];
 	subagentOnlyExtensions?: string[];
 	mcpDirectTools?: string[];
@@ -481,7 +499,10 @@ export function resolvePiLaunchToolPlan(
 					? ["read", ...requestedBuiltinTools]
 					: requestedBuiltinTools
 				).filter((tool) => !allowedToolSet || allowedToolSet.has(tool));
-	const fanoutAuthorized = declaredBuiltinTools.includes("subagent");
+	const fanoutAuthorized = declaredBuiltinTools.includes("subagent") || (
+		input.allowNestedSubagents === true &&
+		(!allowedToolSet || allowedToolSet.has("subagent"))
+	);
 	const toolExtensionPaths: string[] = capabilityCeiling?.denyExtensions
 		? []
 		: (input.tools ?? []).filter(
@@ -496,8 +517,13 @@ export function resolvePiLaunchToolPlan(
 		throw new Error(formatUnresolvedMcpDirectToolSelectors(mcpResolution.unresolvedSelectors));
 	}
 	const resolvedMcpSelections = mcpResolution.selections;
+	const resolvedMcpNames = new Set(resolvedMcpSelections.map((selection) => selection.name));
+	const legacyMcpNameCounts = countLegacyUnderscoreMcpToolNames(resolvedMcpSelections);
 	const effectiveMcpSelections = resolvedMcpSelections.filter(
-		(selection) => !allowedToolSet || allowedToolSet.has(selection.name),
+		(selection) =>
+			!allowedToolSet ||
+			allowedToolSet.has(selection.name) ||
+			isLegacyUnderscoreMcpToolAllowed(selection, allowedToolSet, resolvedMcpNames, legacyMcpNameCounts),
 	);
 	const effectiveMcpTools = effectiveMcpSelections.map(
 		(selection) => selection.name,
@@ -652,6 +678,36 @@ export function resolvePiLaunchToolPlan(
 	};
 }
 
+// Capability ceilings persisted before #1685 may still name hyphenated MCP server prefixes with underscores.
+function countLegacyUnderscoreMcpToolNames(selections: readonly ResolvedMcpDirectToolSelection[]): Map<string, number> {
+	const counts = new Map<string, number>();
+	for (const selection of selections) {
+		const legacyName = legacyUnderscoreMcpToolName(selection);
+		if (legacyName !== selection.name) counts.set(legacyName, (counts.get(legacyName) ?? 0) + 1);
+	}
+	return counts;
+}
+
+function isLegacyUnderscoreMcpToolAllowed(
+	selection: ResolvedMcpDirectToolSelection,
+	allowedToolSet: ReadonlySet<string>,
+	resolvedMcpNames: ReadonlySet<string>,
+	legacyMcpNameCounts: ReadonlyMap<string, number>,
+): boolean {
+	const legacyName = legacyUnderscoreMcpToolName(selection);
+	return legacyMcpNameCounts.get(legacyName) === 1 && !resolvedMcpNames.has(legacyName) && allowedToolSet.has(legacyName);
+}
+
+function legacyUnderscoreMcpToolName(selection: ResolvedMcpDirectToolSelection): string {
+	const slash = selection.selector.indexOf("/");
+	if (slash < 1) return selection.name;
+	const toolName = selection.selector.slice(slash + 1);
+	const suffix = `_${toolName}`;
+	if (!selection.name.endsWith(suffix)) return selection.name;
+	const prefix = selection.name.slice(0, -suffix.length);
+	return `${prefix.replace(/-/g, "_")}${suffix}`;
+}
+
 /** Escape XML-significant characters in a string for safe attribute interpolation. */
 function escapeXmlAttr(value: string): string {
 	return value
@@ -684,6 +740,7 @@ export function buildPiArgs(input: BuildPiArgsInput): BuildPiArgsResult {
 
 	const toolPlan = resolvePiLaunchToolPlan({
 		tools: input.tools,
+		allowNestedSubagents: input.allowNestedSubagents,
 		extensions: input.extensions,
 		subagentOnlyExtensions: input.subagentOnlyExtensions,
 		mcpDirectTools: input.mcpDirectTools,
@@ -795,6 +852,9 @@ export function buildPiArgs(input: BuildPiArgsInput): BuildPiArgsResult {
 	if (input.waitToolEnabled !== undefined) {
 		env[WAIT_TOOL_ENABLED_ENV] = input.waitToolEnabled ? "true" : "false";
 	}
+	if (input.waitToolDefaultTimeoutMs !== undefined) {
+		env[WAIT_TOOL_DEFAULT_TIMEOUT_MS_ENV] = String(input.waitToolDefaultTimeoutMs);
+	}
 	const inheritedNestedRoute = Boolean(
 		process.env[SUBAGENT_PARENT_EVENT_SINK_ENV] &&
 			process.env[SUBAGENT_PARENT_ROOT_RUN_ID_ENV] &&
@@ -878,6 +938,9 @@ export function buildPiArgs(input: BuildPiArgsInput): BuildPiArgsResult {
 	if (input.intercomSessionName) {
 		env.PI_SUBAGENT_INTERCOM_SESSION_NAME = input.intercomSessionName;
 	}
+	if (input.sessionName?.trim()) {
+		env.PI_SUBAGENT_SESSION_NAME = input.sessionName.trim();
+	}
 	if (input.orchestratorIntercomTarget) {
 		env[SUBAGENT_ORCHESTRATOR_TARGET_ENV] = input.orchestratorIntercomTarget;
 	}
@@ -956,6 +1019,7 @@ export function buildPiArgs(input: BuildPiArgsInput): BuildPiArgsResult {
 
 	env[SUBAGENT_PARENT_SESSION_ENV] =
 		input.parentSessionId ?? process.env[SUBAGENT_PARENT_SESSION_ENV] ?? "";
+	env[SUBAGENT_FORK_CACHE_KEY_ENV] = input.forkCacheKey?.trim() || undefined;
 
 	return {
 		args,

@@ -14,9 +14,7 @@ import { resolveEffectiveThinking } from "../shared/model-info.ts";
 import { assertThinkingWithinCeiling, decodeThinkingCeiling, intersectThinkingCeilings, SUBAGENT_THINKING_CEILING_ENV, type ThinkingLevel } from "../shared/thinking-ceiling.ts";
 import { SUBAGENT_LIFECYCLE_ARTIFACT_VERSION, type ArtifactDirPreference, type ArtifactPaths, type JsonSchemaObject, type OutputMode } from "../shared/types.ts";
 import { capabilityCeilingAgentRestrictionMessage, intersectSubagentCapabilityCeilings, type ResolvedSubagentCapabilityCeiling, type SubagentCapabilityAudit } from "../runs/shared/capability-ceiling.ts";
-import { appendTurnBudgetSystemPrompt } from "../runs/shared/turn-budget.ts";
 import { resolvePermissionRules } from "../runs/shared/permissions.ts";
-import type { ResolvedTurnBudget } from "../shared/types.ts";
 import type { ResolvedMcpDirectToolSelection } from "../runs/shared/mcp-direct-tool-allowlist.ts";
 import { resolveStepBehavior } from "../shared/settings.ts";
 import { canPreferForkFromSnapshot, resolveSubagentLaunchContext } from "../shared/fork-context.ts";
@@ -69,7 +67,6 @@ export interface SubagentLaunchContractInput {
 	outputMode?: OutputMode;
 	outputSchema?: JsonSchemaObject;
 	extensionBindings?: ExtensionBindings;
-	turnBudget?: ResolvedTurnBudget;
 	artifacts?: boolean;
 	artifactDir?: ArtifactDirPreference;
 	parentSessionFile?: string | null;
@@ -225,8 +222,8 @@ function taskWorkspaceScopeAuthorityDiagnostic(task: string | undefined): Subage
 	};
 }
 
-function candidateList(inputAgent: string, selected: AgentConfig | undefined, cwd: string): SubagentLaunchContractAgentCandidate[] {
-	const all = discoverAgentsAll(cwd);
+function candidateList(inputAgent: string, selected: AgentConfig | undefined, cwd: string, provider?: string): SubagentLaunchContractAgentCandidate[] {
+	const all = discoverAgentsAll(cwd, provider);
 	return [...all.builtin, ...all.package, ...all.user, ...all.project]
 		.filter((agent) => Boolean(resolveAgentName(inputAgent, [agent]).agent))
 		.map((agent) => ({
@@ -260,7 +257,8 @@ export async function resolveSubagentLaunchContract(input: SubagentLaunchContrac
 		return { ok: false, code: "invalid_artifact_dir", message: `Unsupported artifactDir '${String(input.artifactDir)}'; expected 'project', 'session', or 'temp'.`, diagnostics };
 	}
 	const scope = resolveExecutionAgentScope(input.agentScope);
-	const discovered = discoverAgents(effectiveCwd, scope);
+	const parentProvider = input.preferredProvider ?? input.parentModel?.provider;
+	const discovered = discoverAgents(effectiveCwd, scope, parentProvider);
 	const resolvedAgent = resolveAgentName(input.agent, discovered.agents);
 	const ambiguousCandidates = resolvedAgent.error
 		? discovered.agents.filter((agent) => resolveAgentName(input.agent, [agent]).agent)
@@ -353,6 +351,7 @@ export async function resolveSubagentLaunchContract(input: SubagentLaunchContrac
 	try {
 		toolPlan = resolvePiLaunchToolPlan({
 			tools: agent.tools,
+			allowNestedSubagents: agent.allowNestedSubagents,
 			extensions: agent.extensions,
 			subagentOnlyExtensions: agent.subagentOnlyExtensions,
 			mcpDirectTools: agent.mcpDirectTools,
@@ -398,9 +397,7 @@ export async function resolveSubagentLaunchContract(input: SubagentLaunchContrac
 	const memoryInjection = buildAgentMemoryInjection(agent, effectiveCwd);
 	if (memoryInjection) effectiveSystemPrompt = effectiveSystemPrompt ? `${effectiveSystemPrompt}\n\n${memoryInjection}` : memoryInjection;
 	effectiveSystemPrompt = injectOutputPathSystemPrompt(effectiveSystemPrompt, outputPath, agent);
-	const turnBudget = input.turnBudget ?? agent.defaultTurnBudget;
-	effectiveSystemPrompt = appendTurnBudgetSystemPrompt(effectiveSystemPrompt, turnBudget);
-	const candidates = candidateList(input.agent, agent, effectiveCwd);
+	const candidates = candidateList(input.agent, agent, effectiveCwd, parentProvider);
 	const shadowedCandidates = candidates.filter((candidate) => !candidate.selected);
 	const definitionDigest = agentDefinitionDigest(agent);
 	const contractBase: Omit<SubagentLaunchContract, "digest"> = {

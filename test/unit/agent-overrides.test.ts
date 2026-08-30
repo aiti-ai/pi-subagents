@@ -342,6 +342,7 @@ describe("builtin agent overrides", () => {
 						systemPromptMode: "replace",
 						inheritProjectContext: true,
 						inheritSkills: true,
+						allowNestedSubagents: true,
 						acceptanceRole: "writer",
 						subagentOnlyExtensions: ["./tools/child-review.ts"],
 						mutationTools: ["replace", "undo_last_replace"],
@@ -360,6 +361,7 @@ describe("builtin agent overrides", () => {
 		assert.equal(reviewer.systemPromptMode, "replace");
 		assert.equal(reviewer.inheritProjectContext, true);
 		assert.equal(reviewer.inheritSkills, true);
+		assert.equal(reviewer.allowNestedSubagents, true);
 		assert.equal(reviewer.acceptanceRole, "writer");
 		assert.deepEqual(reviewer.subagentOnlyExtensions, ["./tools/child-review.ts"]);
 		assert.deepEqual(reviewer.mutationTools, ["replace", "undo_last_replace"]);
@@ -479,6 +481,76 @@ describe("builtin agent overrides", () => {
 		assert.equal(reviewer.thinking, "high");
 		assert.equal(reviewer.override?.scope, "project");
 		assert.equal(reviewer.override?.path, path.join(tempProject, ".pi", "settings.json"));
+	});
+
+	it("layers active-provider overrides over default agentOverrides", () => {
+		writeJson(path.join(tempHome, ".pi", "agent", "settings.json"), {
+			subagents: {
+				agentOverrides: {
+					worker: { model: "openai/gpt-5-mini", thinking: "low" },
+				},
+				agentOverridesByProvider: {
+					"github-copilot": {
+						worker: { model: "github-copilot/gpt-5-mini", thinking: "high" },
+					},
+					openrouter: {
+						worker: { model: "openrouter/openai/gpt-5-mini" },
+					},
+				},
+			},
+		});
+
+		const defaultWorker = discoverAgents(tempProject, "both").agents.find((agent) => agent.name === "worker");
+		const copilotWorker = discoverAgents(tempProject, "both", "github-copilot").agents.find((agent) => agent.name === "worker");
+		const openrouterWorker = discoverAgents(tempProject, "both", "openrouter").agents.find((agent) => agent.name === "worker");
+		assert.equal(defaultWorker?.model, "openai/gpt-5-mini");
+		assert.equal(defaultWorker?.thinking, "low");
+		assert.equal(copilotWorker?.model, "github-copilot/gpt-5-mini");
+		assert.equal(copilotWorker?.thinking, "high");
+		assert.equal(openrouterWorker?.model, "openrouter/openai/gpt-5-mini");
+		assert.equal(openrouterWorker?.thinking, "low");
+	});
+
+	it("keeps project precedence when provider-specific overrides are active", () => {
+		writeJson(path.join(tempHome, ".pi", "agent", "settings.json"), {
+			subagents: { agentOverridesByProvider: { openrouter: { worker: { model: "openrouter/user-model", thinking: "low" } } } },
+		});
+		writeJson(path.join(tempProject, ".pi", "settings.json"), {
+			subagents: {
+				agentOverrides: {
+					worker: { thinking: "medium" },
+				},
+				agentOverridesByProvider: {
+					openrouter: { worker: { model: "openrouter/project-model", thinking: "high" } },
+				},
+			},
+		});
+
+		const worker = discoverAgents(tempProject, "both", "openrouter").agents.find((agent) => agent.name === "worker");
+		assert.equal(worker?.model, "openrouter/project-model");
+		assert.equal(worker?.thinking, "high");
+		assert.equal(worker?.override?.scope, "project");
+	});
+
+	it("keeps provider overrides unambiguous for agents named like override fields", () => {
+		writeJson(path.join(tempHome, ".pi", "agent", "settings.json"), {
+			subagents: {
+				agentOverridesByProvider: {
+					openrouter: {
+						model: { model: "openrouter/special-model" },
+						tools: { thinking: "high" },
+					},
+				},
+			},
+		});
+		fs.mkdirSync(path.join(tempHome, ".pi", "agent", "agents"), { recursive: true });
+		for (const name of ["model", "tools"]) {
+			fs.writeFileSync(path.join(tempHome, ".pi", "agent", "agents", `${name}.md`), `---\nname: ${name}\ndescription: ${name}\n---\n`, "utf-8");
+		}
+
+		const agents = discoverAgents(tempProject, "both", "openrouter").agents;
+		assert.equal(agents.find((agent) => agent.name === "model")?.model, "openrouter/special-model");
+		assert.equal(agents.find((agent) => agent.name === "tools")?.thinking, "high");
 	});
 
 	it("layers a project override on top of a user override for a custom agent instead of discarding it", () => {

@@ -1,12 +1,12 @@
 import { createHash } from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
-import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type { BeforeProviderRequestEvent, ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { registerNativeSupervisorClient } from "../../intercom/native-supervisor-channel.ts";
 import { shouldUseNativeFsWatch } from "../../shared/watch-strategy.ts";
 import { decodePermissionRules, permissionDecision, PERMISSION_AUDIT_PATH_ENV, PERMISSION_POLICY_ENV } from "./permissions.ts";
 import { consumeSteerRequestsFromDir, MAX_STEER_QUEUE_SIZE, steerAckPathFromDir, writeSteerAckAt, writeSteerCapabilityAt, writeSteerRequestToDir, type SteerDeliveryStatus, type SteerRequest } from "../background/control-channel.ts";
-import { SUBAGENT_CHILD_AGENT_ENV, SUBAGENT_CHILD_INDEX_ENV, SUBAGENT_FANOUT_CHILD_ENV, SUBAGENT_INHERIT_GLOBAL_CONTEXT_ENV, SUBAGENT_STEER_ACK_DIR_ENV, SUBAGENT_STEER_CAPABILITY_ENV, SUBAGENT_STEER_INBOX_ENV } from "./pi-args.ts";
+import { SUBAGENT_CHILD_AGENT_ENV, SUBAGENT_CHILD_INDEX_ENV, SUBAGENT_FANOUT_CHILD_ENV, SUBAGENT_FORK_CACHE_KEY_ENV, SUBAGENT_INHERIT_GLOBAL_CONTEXT_ENV, SUBAGENT_STEER_ACK_DIR_ENV, SUBAGENT_STEER_CAPABILITY_ENV, SUBAGENT_STEER_INBOX_ENV } from "./pi-args.ts";
 import { RUNTIME_EXTENSION_ACK_EVENT, RUNTIME_EXTENSION_ACK_PATH_ENV, isRuntimeAcknowledgedExtensionId, writeRuntimeAcknowledgedExtensions } from "./runtime-acknowledged-extensions.ts";
 import { createStructuredOutputToolParameters, STRUCTURED_OUTPUT_ACCEPTANCE_CAPTURE_ENV, STRUCTURED_OUTPUT_CAPTURE_ENV, STRUCTURED_OUTPUT_SCHEMA_ENV, validateStructuredOutputValue } from "./structured-output.ts";
 import {
@@ -32,6 +32,9 @@ import { drainOutstandingWork } from "../background/auto-drain.ts";
 const SUBAGENT_INHERIT_PROJECT_CONTEXT_ENV = "PI_SUBAGENT_INHERIT_PROJECT_CONTEXT";
 const SUBAGENT_INHERIT_SKILLS_ENV = "PI_SUBAGENT_INHERIT_SKILLS";
 export const SUBAGENT_INTERCOM_SESSION_NAME_ENV = "PI_SUBAGENT_INTERCOM_SESSION_NAME";
+/** Human-readable child display name (agent + task excerpt) set by the parent
+ *  at launch; applied via pi.setSessionName when no intercom target exists. */
+export const SUBAGENT_SESSION_NAME_ENV = "PI_SUBAGENT_SESSION_NAME";
 const STEERING_LEGACY_SETTLE_FALLBACK_MS = 1000;
 const STEERING_SAFETY_POLL_INTERVAL_MS = 5000;
 
@@ -288,9 +291,26 @@ const PORTABLE_TOOL_ID_PATTERN = /^[a-zA-Z0-9_-]+$/;
 const MAX_PORTABLE_TOOL_ID_LENGTH = 64;
 const COMPOSITE_TOOL_ID_APIS = new Set([
 	"azure-openai-responses",
+	"cursor-native",
 	"openai-completions",
 	"openai-responses",
 ]);
+const PROMPT_CACHE_KEY_APIS = new Set([
+	"azure-openai-responses",
+	"openai-codex-responses",
+	"openai-completions",
+	"openai-responses",
+]);
+
+export function rewriteForkCacheProviderRequest(event: BeforeProviderRequestEvent, ctx?: Pick<ExtensionContext, "model">): unknown {
+	const forkCacheKey = process.env[SUBAGENT_FORK_CACHE_KEY_ENV]?.trim();
+	if (!forkCacheKey || !PROMPT_CACHE_KEY_APIS.has(ctx?.model?.api ?? "")) return undefined;
+	if (!event || typeof event !== "object") return undefined;
+	const payload = event.payload;
+	if (!payload || typeof payload !== "object" || Array.isArray(payload)) return undefined;
+	if (typeof (payload as { prompt_cache_key?: unknown }).prompt_cache_key !== "string") return undefined;
+	return { ...payload, prompt_cache_key: forkCacheKey };
+}
 
 function portableToolId(id: string): string {
 	if (PORTABLE_TOOL_ID_PATTERN.test(id) && id.length <= MAX_PORTABLE_TOOL_ID_LENGTH) return id;
@@ -671,7 +691,7 @@ export default function registerSubagentPromptRuntime(pi: ExtensionAPI): void {
 	registerPermissionGate(pi);
 	registerToolBudget(pi, decodeToolBudgetEnv(process.env[TOOL_BUDGET_ENV], { allowZero: process.env[TOOL_BUDGET_ZERO_AUTH_ENV] === "1" }));
 	registerChildWatchdog(pi);
-	const waitToolEnabled = resolveWaitToolConfig().enabled;
+	const waitToolConfig = resolveWaitToolConfig();
 	const waitState = {
 		baseCwd: "",
 		currentSessionId: null,
@@ -686,7 +706,7 @@ export default function registerSubagentPromptRuntime(pi: ExtensionAPI): void {
 		watcherRestartTimer: null,
 		resultFileCoalescer: { schedule: () => false, clear: () => {} },
 	} as unknown as SubagentState;
-	if (typeof pi.registerTool === "function") registerWaitTool(pi, waitState, waitToolEnabled);
+	if (typeof pi.registerTool === "function") registerWaitTool(pi, waitState, waitToolConfig.enabled, undefined, waitToolConfig.defaultTimeoutMs);
 	let nativeSupervisorClientRegistered = false;
 	const registerNativeSupervisorClientOnce = (): void => {
 		if (nativeSupervisorClientRegistered) return;
@@ -744,6 +764,8 @@ export default function registerSubagentPromptRuntime(pi: ExtensionAPI): void {
 		});
 	}
 
+	onRuntimeEvent("before_provider_request", (event: unknown, ctx?: ExtensionContext) => rewriteForkCacheProviderRequest(event as BeforeProviderRequestEvent, ctx));
+
 	onRuntimeEvent("context", (event: unknown, ctx?: ExtensionContext) => {
 		if (!event || typeof event !== "object" || !("messages" in event) || !Array.isArray(event.messages)) return undefined;
 		const messages = stripParentOnlySubagentMessages(event.messages, {
@@ -756,9 +778,14 @@ export default function registerSubagentPromptRuntime(pi: ExtensionAPI): void {
 	onRuntimeEvent("before_agent_start", async (event: unknown) => {
 		if (!event || typeof event !== "object" || !("systemPrompt" in event) || typeof event.systemPrompt !== "string") return undefined;
 		registerNativeSupervisorClientOnce();
+		// The intercom target is a routing address and always wins; the display
+		// name (agent + task excerpt, computed by the parent at launch) only
+		// applies when the bridge is not addressing this child.
 		const intercomSessionName = process.env[SUBAGENT_INTERCOM_SESSION_NAME_ENV]?.trim();
-		if (intercomSessionName && typeof pi.setSessionName === "function") {
-			pi.setSessionName(intercomSessionName);
+		const displaySessionName = process.env[SUBAGENT_SESSION_NAME_ENV]?.trim();
+		const childSessionName = intercomSessionName || displaySessionName;
+		if (childSessionName && typeof pi.setSessionName === "function") {
+			pi.setSessionName(childSessionName);
 		}
 
 		const inheritProjectContext = readBooleanEnv(SUBAGENT_INHERIT_PROJECT_CONTEXT_ENV);

@@ -25,6 +25,8 @@ import { listAsyncRuns, type AsyncRunSummary } from "./async-status.ts";
 import { EXTERNAL_JOB_BRIDGE_REQUEST_DIR, serviceExternalJobBridgeRequests } from "../shared/external-job-bridge.ts";
 import { shouldUseNativeFsWatch } from "../../shared/watch-strategy.ts";
 import { parseWorkflowChildSummary } from "../../workflows/workflow-child-summary.ts";
+import { validHostStepNodes } from "../shared/host-step-status.ts";
+import { withCachedUiContext } from "../../shared/extension-context.ts";
 
 interface AsyncJobTrackerOptions {
 	completionRetentionMs?: number;
@@ -78,23 +80,19 @@ export function createAsyncJobTracker(pi: Pick<ExtensionAPI, "events">, state: S
 	const watch = options.watch ?? fs.watch;
 	const useNativeWatcher = () => shouldUseNativeFsWatch("async-job-tracker", options.platform);
 	const terminalStatus = (status: string) => status === "complete" || status === "failed" || status === "paused" || status === "stopped";
+	const withLastUiContext = <T>(run: (ctx: ExtensionContext) => T): T | undefined => {
+		const cached = state.lastUiContext;
+		return withCachedUiContext(cached, () => {
+			if (state.lastUiContext === cached) state.lastUiContext = null;
+		}, run);
+	};
 	const rerenderWidget = (ctx: ExtensionContext, jobs = Array.from(state.asyncJobs.values())) => {
 		if (state.widgetsSuspended) return;
 		renderWidget(ctx, options.widgetEnabled === false ? [] : jobs);
 		(ctx.ui as { requestRender?: () => void }).requestRender?.();
 	};
 	const rerenderLastWidget = (jobs = Array.from(state.asyncJobs.values())) => {
-		const ctx = state.lastUiContext;
-		if (!ctx) return;
-		try {
-			if (ctx.hasUI) rerenderWidget(ctx, jobs);
-		} catch (error) {
-			if (error instanceof Error && error.message.includes("extension ctx is stale")) {
-				state.lastUiContext = null;
-				return;
-			}
-			throw error;
-		}
+		withLastUiContext((ctx) => rerenderWidget(ctx, jobs));
 	};
 	const requestLastWidgetRender = () => {
 		if (options.widgetEnabled === false) return;
@@ -147,6 +145,9 @@ export function createAsyncJobTracker(pi: Pick<ExtensionAPI, "events">, state: S
 			currentStep: run.currentStep,
 			chainStepCount: run.chainStepCount,
 			parallelGroups: groups,
+			hostSteps: run.hostSteps,
+			...(run.mode === "workflow" && run.workflowGraph ? { workflowGraph: run.workflowGraph } : {}),
+			preflight: run.preflight,
 			steps: visibleSteps,
 			stepsTotal: visibleSteps.length,
 			runningSteps: visibleSteps.filter((step) => step.status === "running").length,
@@ -342,7 +343,7 @@ export function createAsyncJobTracker(pi: Pick<ExtensionAPI, "events">, state: S
 	};
 
 	const refreshJob = (job: AsyncJobState): boolean => {
-		const widgetExpanded = state.lastUiContext?.hasUI ? state.lastUiContext.ui.getToolsExpanded?.() ?? false : false;
+		const widgetExpanded = withLastUiContext((ctx) => ctx.ui.getToolsExpanded?.() ?? false) ?? false;
 		const widgetStateBefore = widgetRenderKey(job, widgetExpanded);
 		let nestedRefreshFailed = false;
 		const refreshNestedProjection = () => {
@@ -399,7 +400,10 @@ export function createAsyncJobTracker(pi: Pick<ExtensionAPI, "events">, state: S
 				job.mode = status.mode;
 				job.parentWorkflowRunId = status.parentWorkflowRunId ?? job.parentWorkflowRunId;
 				job.workflowKey = status.workflowKey ?? job.workflowKey;
+				job.lane = status.lane ?? job.lane;
 				job.workflow = status.workflow ?? job.workflow;
+				if (status.mode === "workflow") job.workflowGraph = status.workflowGraph ?? job.workflowGraph;
+				job.hostSteps = validHostStepNodes(status.workflowGraph);
 				const workflowChildren = parseWorkflowChildSummary(status.workflowChildren);
 				if (workflowChildren && workflowChildren.workflowRunId !== status.runId) throw new Error("workflowChildren.workflowRunId does not match async status runId.");
 				job.workflowChildren = workflowChildren ?? job.workflowChildren;
@@ -625,6 +629,7 @@ export function createAsyncJobTracker(pi: Pick<ExtensionAPI, "events">, state: S
 			turnBudget: info.turnBudget,
 			parentWorkflowRunId: info.parentWorkflowRunId,
 			workflowKey: info.workflowKey,
+			...(info.mode === "workflow" && info.workflowGraph ? { workflowGraph: info.workflowGraph } : {}),
 			controlEventCursor: 0,
 		});
 		const job = state.asyncJobs.get(info.id)!;
