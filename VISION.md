@@ -31,6 +31,21 @@ When behavior cannot be proven, the system fails closed instead of reporting opt
 
 Existing primitives come first.
 A new mode, runner, or abstraction is justified only when current primitives cannot honestly express the needed behavior.
+Before adding anything, name the existing path that produces the same outcome: a config value, a reload, an instruction, a flag, or a primitive that already exists.
+If that path exists and costs the operator one ordinary action, the request is already satisfied and the change does not fit.
+A second path to the same outcome is only justified when the existing one loses work, cannot express the need, or is unavailable where the need occurs.
+Convenience alone is not enough; every parallel path adds docs, status text, tests, and a new way for behavior to disagree with configuration.
+
+## Compatibility is explicit
+
+Default to hard cutovers when replacing a tool, option, behavior, or public surface.
+Do not keep aliases, migration shims, legacy code paths, or compatibility modes unless the owner asks for them or the release contract requires them.
+Compatibility has a cost: extra docs, tests, status text, support paths, and future ambiguity.
+When that cost is not deliberately accepted, remove the old path cleanly and make the new contract obvious.
+
+Tests should prove the current contract.
+Do not add defensive tests that preserve removed behavior, stale migration paths, or compatibility the project no longer wants.
+For removals, update or delete obsolete assertions instead of making production code serve them.
 
 ## Scope must earn size
 
@@ -68,6 +83,7 @@ A passing demo is not a capability contract.
 It does not become a general project manager or issue tracker.
 It does not own CI, merge policy, or release policy; it reports evidence into those systems.
 It does not add integrations for niche tools without clear demand.
+It does not add a second path to an outcome the operator can already reach with one ordinary action.
 It does not treat external agents as native Pi children before their capabilities are proven.
 It does not run background reviewers on every edit by default; delegation happens because the operator asked for it, directly or through their instructions.
 It does not accept a slower status loop, watcher, or common workflow just to make the machinery look richer.
@@ -76,6 +92,7 @@ It does not accept a slower status loop, watcher, or common workflow just to mak
 
 A change fits when it gives one operator more leverage with the same or better control, visibility, and evidence.
 A change fits when it composes from existing primitives or honestly shows why it cannot.
+A change fits when no existing path already gives the operator the same outcome, or it shows why that path fails.
 A change fits when it keeps or improves speed and token cost, or proves why a cost is worth paying.
 A change does not fit when it adds hot-path cost without proof, hides running work, accepts confidence in place of evidence, widens authority beyond the operator's instructions, or grows scope toward general project management.
 When a proposal is in doubt, ask whether it makes delegation more trustworthy for the person whose name it runs under.

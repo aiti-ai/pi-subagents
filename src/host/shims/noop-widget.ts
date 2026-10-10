@@ -14,11 +14,12 @@
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { renderWidget as renderTuiWidget, widgetRenderKey as tuiWidgetRenderKey } from "../../tui/render.ts";
 import type { AsyncJobState } from "../../shared/types.ts";
+import type { AsyncWidgetLayout } from "../../shared/types.ts";
 import { resolveHostCaps } from "../caps.ts";
 
-export function renderWidget(ctx: ExtensionContext, jobs: AsyncJobState[]): void {
+export function renderWidget(ctx: ExtensionContext, jobs: AsyncJobState[], initiallyCollapsed = false, layout: AsyncWidgetLayout = "adaptive"): void {
 	if (!resolveHostCaps().widget) return;
-	renderTuiWidget(ctx, jobs);
+	renderTuiWidget(ctx, jobs, initiallyCollapsed, layout);
 }
 
 export function widgetRenderKey(job: AsyncJobState, expanded = false): string {

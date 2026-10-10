@@ -12,7 +12,7 @@ function isIntercomDetached(run: AsyncRunSummary): boolean {
 
 function formatIntercomDetachGuidance(run: AsyncRunSummary): string | undefined {
 	if (!isIntercomDetached(run)) return undefined;
-	return `Run "${run.id}" detached for intercom coordination. Reply to the supervisor request first, then wait with subagent_wait({ id: "${run.id}" }). Use subagent({ action: "status", id: "${run.id}" }) to recover the result; do not resume or launch a replacement while it remains detached.`;
+	return `Run "${run.id}" detached for intercom coordination. Reply to the supervisor request first, then wait with bg_wait({ id: "${run.id}" }). Use subagent({ action: "status", id: "${run.id}" }) to recover the result; do not resume or launch a replacement while it remains detached.`;
 }
 
 export function formatAsyncReviveCommand(run: AsyncRunSummary): string | undefined {
@@ -25,8 +25,8 @@ export function formatAsyncReviveCommand(run: AsyncRunSummary): string | undefin
 	} catch {
 		return undefined;
 	}
-	const index = run.steps.length === 1 ? "" : `, index: ${step.index}`;
-	return `subagent({ action: "resume", id: "${run.id}"${index}, message: "Continue from the persisted child session and report the result." })`;
+	const index = run.steps.length === 1 ? "" : `, options: { index: ${step.index} }`;
+	return `subagent({ action: "resume", id: "${run.id}", message: "Continue from the persisted child session and report the result."${index} })`;
 }
 
 export function formatResumeFirstFailedRunDetail(run: AsyncRunSummary): string | undefined {
