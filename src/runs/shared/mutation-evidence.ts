@@ -1,4 +1,4 @@
-import { execFileSync } from "node:child_process";
+import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
 import * as fs from "node:fs";
 import * as os from "node:os";
@@ -14,27 +14,41 @@ function gitArguments(args: string[]): string[] {
 	return ["-c", "core.fsmonitor=false", ...args];
 }
 
-function gitOutput(cwd: string, args: string[], maxBuffer = MAX_HASH_BYTES): string {
-	return execFileSync("git", gitArguments(args), { cwd, encoding: "utf-8", stdio: ["ignore", "pipe", "pipe"], maxBuffer, windowsHide: true });
+/**
+ * 异步 git 调用（2026-09-12 execSync→async 改造）：错误形态对齐 execFileSync（err.stdout/stderr）。
+ * 性能红线：pi 扩展进程内不得重新引入 execFileSync/spawnSync。
+ */
+function gitOutput(cwd: string, args: string[], maxBuffer = MAX_HASH_BYTES): Promise<string> {
+	return new Promise((resolve, reject) => {
+		execFile("git", gitArguments(args), { cwd, encoding: "utf-8", maxBuffer, windowsHide: true }, (err, stdout) => {
+			if (err) { (err as Error & { stdout?: string }).stdout = typeof stdout === "string" ? stdout : ""; reject(err); }
+			else resolve(String(stdout ?? ""));
+		});
+	});
 }
 
 function splitNul(output: string): string[] {
 	return output.split("\0").filter((part) => part.length > 0);
 }
 
-function hashLargeDiff(cwd: string, relativePath: string): string {
+async function hashLargeDiff(cwd: string, relativePath: string): Promise<string> {
 	const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-subagents-tracked-diff-"));
 	const diffPath = path.join(tempDir, "diff.patch");
 	try {
-		execFileSync("git", gitArguments(["diff", "--no-ext-diff", "--binary", `--output=${diffPath}`, "HEAD", "--", relativePath]), { cwd, stdio: "ignore", windowsHide: true });
+		await new Promise<void>((resolve, reject) => {
+			execFile("git", gitArguments(["diff", "--no-ext-diff", "--binary", `--output=${diffPath}`, "HEAD", "--", relativePath]), { cwd, windowsHide: true }, (err: Error | null) => (err ? reject(err) : resolve()));
+		});
 		const hash = createHash("sha256");
 		const buffer = Buffer.allocUnsafe(64 * 1024);
 		const fd = fs.openSync(diffPath, "r");
 		try {
+			let chunks = 0;
 			for (;;) {
 				const bytesRead = fs.readSync(fd, buffer, 0, buffer.length, null);
 				if (bytesRead === 0) break;
 				hash.update(buffer.subarray(0, bytesRead));
+				// 大 diff 哈希让步事件循环（2026-10-10）：每 32 块（~2MB）yield 一次，防长时间霸占
+				if (++chunks % 32 === 0) await new Promise<void>((resolve) => setImmediate(resolve));
 			}
 		} finally {
 			fs.closeSync(fd);
@@ -45,17 +59,17 @@ function hashLargeDiff(cwd: string, relativePath: string): string {
 	}
 }
 
-function listChangedTrackedFiles(cwd: string): { paths: string[]; truncated: boolean } {
-	const paths = splitNul(gitOutput(cwd, ["diff", "--no-ext-diff", "--name-only", "-z", "HEAD", "--"], MAX_HASH_BYTES));
+async function listChangedTrackedFiles(cwd: string): Promise<{ paths: string[]; truncated: boolean }> {
+	const paths = splitNul(await gitOutput(cwd, ["diff", "--no-ext-diff", "--name-only", "-z", "HEAD", "--"], MAX_HASH_BYTES));
 	return { paths: paths.slice(0, MAX_TRACKED_PATHS), truncated: paths.length > MAX_TRACKED_PATHS };
 }
 
-function fingerprintPath(cwd: string, relativePath: string): TrackedMutationFingerprint {
+async function fingerprintPath(cwd: string, relativePath: string): Promise<TrackedMutationFingerprint> {
 	try {
-		const diff = gitOutput(cwd, ["diff", "--no-ext-diff", "--binary", "HEAD", "--", relativePath], MAX_HASH_BYTES);
+		const diff = await gitOutput(cwd, ["diff", "--no-ext-diff", "--binary", "HEAD", "--", relativePath], MAX_HASH_BYTES);
 		return { kind: "diff", digest: createHash("sha256").update(diff).digest("hex") };
 	} catch {
-		return { kind: "diff", digest: hashLargeDiff(cwd, relativePath) };
+		return { kind: "diff", digest: await hashLargeDiff(cwd, relativePath) };
 	}
 }
 
@@ -64,23 +78,23 @@ function sameFingerprint(left: TrackedMutationFingerprint | undefined, right: Tr
 	return left.digest === right.digest;
 }
 
-export function snapshotTrackedMutations(cwd: string): TrackedMutationSnapshot {
+export async function snapshotTrackedMutations(cwd: string): Promise<TrackedMutationSnapshot> {
 	try {
-		const changed = listChangedTrackedFiles(cwd);
+		const changed = await listChangedTrackedFiles(cwd);
 		const fingerprints: Record<string, TrackedMutationFingerprint> = {};
-		for (const file of changed.paths) fingerprints[file] = fingerprintPath(cwd, file);
+		for (const file of changed.paths) fingerprints[file] = await fingerprintPath(cwd, file);
 		return { source: "tracked-files", trackedOnly: true, cwd, dirtyFiles: changed.paths, fingerprints, truncated: changed.truncated };
 	} catch (error) {
 		return { source: "tracked-files", trackedOnly: true, cwd, dirtyFiles: [], fingerprints: {}, unavailable: error instanceof Error ? error.message : String(error) };
 	}
 }
 
-export function collectTrackedMutationEvidence(snapshot: TrackedMutationSnapshot, cwd = snapshot.cwd): TrackedMutationEvidence {
+export async function collectTrackedMutationEvidence(snapshot: TrackedMutationSnapshot, cwd = snapshot.cwd): Promise<TrackedMutationEvidence> {
 	if (snapshot.unavailable) {
 		return { source: "tracked-files", trackedOnly: true, changedFiles: [], attemptedMutation: false, unavailable: snapshot.unavailable };
 	}
 	try {
-		const current = listChangedTrackedFiles(cwd);
+		const current = await listChangedTrackedFiles(cwd);
 		const startDirty = new Set(snapshot.dirtyFiles);
 		const candidates = new Set([...snapshot.dirtyFiles, ...current.paths]);
 		const changedFiles: string[] = [];
@@ -89,7 +103,7 @@ export function collectTrackedMutationEvidence(snapshot: TrackedMutationSnapshot
 				if (!snapshot.truncated) changedFiles.push(file);
 				continue;
 			}
-			if (!sameFingerprint(snapshot.fingerprints[file], fingerprintPath(cwd, file))) changedFiles.push(file);
+			if (!sameFingerprint(snapshot.fingerprints[file], await fingerprintPath(cwd, file))) changedFiles.push(file);
 		}
 		changedFiles.sort();
 		return {

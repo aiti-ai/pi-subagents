@@ -2,7 +2,7 @@ import { readFileSync } from "node:fs";
 import { createRequire } from "node:module";
 import { dirname, resolve as resolvePath } from "node:path";
 import { Worker } from "node:worker_threads";
-import { DEFAULT_GLOBAL_CONCURRENCY_LIMIT, Semaphore } from "../runs/shared/parallel-utils.ts";
+import { resolveEffectiveGlobalConcurrencyLimit, Semaphore } from "../runs/shared/parallel-utils.ts";
 import { HOST_STEP_MAX_COUNT } from "../runs/shared/host-step-status.ts";
 import type { HostStepNodeV1, SingleResult } from "../shared/types.ts";
 import { normalizeWorkflowHostCommandParams, type WorkflowHostCommandParams, type WorkflowHostCommandResult } from "./host-command.ts";
@@ -1521,7 +1521,7 @@ export async function runWorkflowScript(options: RunWorkflowScriptOptions): Prom
 	if (options.globalConcurrencyLimit !== undefined && (!Number.isInteger(options.globalConcurrencyLimit) || options.globalConcurrencyLimit < 1)) {
 		throw new Error("workflow script global concurrency limit must be a positive integer.");
 	}
-	const launchSemaphore = new Semaphore(options.globalConcurrencyLimit ?? DEFAULT_GLOBAL_CONCURRENCY_LIMIT);
+	const launchSemaphore = new Semaphore(resolveEffectiveGlobalConcurrencyLimit(options.globalConcurrencyLimit));
 
 	let acornPath: string;
 	try {

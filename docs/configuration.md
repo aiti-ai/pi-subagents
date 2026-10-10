@@ -243,6 +243,8 @@ The tool timer tracks each active `toolCallId` separately and never extends the 
 
 Caps simultaneously running children inside one run, including durable legacy multi-child runs and `workflowScript` launches through `runs.run`/`runs.all`. Queued workflow children retain their stable keys and begin when a running sibling releases capacity. The default is `20`.
 
+`PI_SUBAGENTS_MAX_CONCURRENT` overrides the built-in default when the config value is unset; it must parse as a positive integer and is otherwise ignored. A valid config value always wins over the environment. Use this cap to protect upstream AI provider rate limits when a workflow fans out many children at once (e.g. `runs.all` with a dozen scouts): excess children queue at launch and start as live siblings finish, so they consume no model quota while waiting.
+
 ## `maxSubagentSpawnsPerSession`
 
 ```json

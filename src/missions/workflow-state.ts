@@ -1,3 +1,5 @@
+// ⚠ 残留 spawnSync 仅剩 windowsProcessStartKey 的 powershell 探测（1s 上限、陈旧锁 rare path）；
+// Linux 路径已零 spawn。后续清理见 docs/exec-sync-to-async-plan.md §8。
 import { execFileSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import * as fs from "node:fs";
@@ -48,13 +50,10 @@ function linuxProcessStartKey(pid: number): string | undefined {
 	}
 }
 
-function psProcessStartKey(pid: number): string | undefined {
-	try {
-		const raw = execFileSync("ps", ["-p", String(pid), "-o", "lstart="], { encoding: "utf-8", stdio: ["ignore", "pipe", "ignore"], timeout: 1000 }).trim();
-		return raw ? `ps:${raw}` : undefined;
-	} catch {
-		return undefined;
-	}
+// ps 兜底已移除（2026-09-12 execSync→async 改造）：/proc 是 Linux 进程信息唯一权威源，
+// /proc/<pid>/stat 读不到即进程不存在（ps 同样会失败）——spawnSync("ps") 兜底属冗余 spawn。
+function psProcessStartKey(_pid: number): string | undefined {
+	return undefined;
 }
 
 function windowsProcessStartKey(pid: number): string | undefined {

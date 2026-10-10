@@ -556,7 +556,7 @@ async function runSingleAttempt(
 		return result;
 	}
 	const spawnEnv = { ...process.env, ...sharedEnv, ...getSubagentDepthEnv(options.maxSubagentDepth) };
-	const mutationSnapshot = snapshotTrackedMutations(options.cwd ?? runtimeCwd);
+	const mutationSnapshot = await snapshotTrackedMutations(options.cwd ?? runtimeCwd);
 	let observedMutationAttempt = false;
 	let structuredOutputToolInvoked = false;
 	let structuredOutputMessageStartIndex: number | undefined;
@@ -1520,7 +1520,7 @@ async function runSingleAttempt(
 		tokens: progress.tokens,
 		durationMs: progress.durationMs,
 	};
-	const mutationEvidence = collectTrackedMutationEvidence(mutationSnapshot, options.cwd ?? runtimeCwd);
+	const mutationEvidence = await collectTrackedMutationEvidence(mutationSnapshot, options.cwd ?? runtimeCwd);
 
 	const acceptanceOutput = getFinalOutput(result.messages ?? []);
 	let fullOutput = stripAcceptanceReport(acceptanceOutput);
