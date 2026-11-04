@@ -15,8 +15,8 @@ function gitArguments(args: string[]): string[] {
 }
 
 /**
- * 异步 git 调用（2026-09-12 execSync→async 改造）：错误形态对齐 execFileSync（err.stdout/stderr）。
- * 性能红线：pi 扩展进程内不得重新引入 execFileSync/spawnSync。
+ * Async git calls (2026-09-12 execSync→async conversion): error shape aligned with execFileSync (err.stdout/stderr).
+ * Performance red line: execFileSync/spawnSync must never be reintroduced inside the pi extension process.
  */
 function gitOutput(cwd: string, args: string[], maxBuffer = MAX_HASH_BYTES): Promise<string> {
 	return new Promise((resolve, reject) => {
@@ -47,7 +47,7 @@ async function hashLargeDiff(cwd: string, relativePath: string): Promise<string>
 				const bytesRead = fs.readSync(fd, buffer, 0, buffer.length, null);
 				if (bytesRead === 0) break;
 				hash.update(buffer.subarray(0, bytesRead));
-				// 大 diff 哈希让步事件循环（2026-10-10）：每 32 块（~2MB）yield 一次，防长时间霸占
+				// Large-diff hashing yields to the event loop (2026-10-10): yield once every 32 chunks (~2MB) to avoid monopolizing it for long stretches.
 				if (++chunks % 32 === 0) await new Promise<void>((resolve) => setImmediate(resolve));
 			}
 		} finally {

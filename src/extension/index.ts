@@ -72,7 +72,7 @@ import { createParentWake } from "../shared/parent-wake.ts";
 import { handleSubagentSteeringNotice, type SubagentSteeringMessageDetails } from "./steering-notices.ts";
 import { SUBAGENT_CHILD_ENV, SUBAGENT_PARENT_SESSION_ENV } from "../runs/shared/child-runtime-config.ts";
 import { disposeChildSessions } from "../runs/shared/child-session.ts";
-import { resolveHostCaps } from "../host/caps.ts"; // [aiti] 宿主能力门控（pi-web 下关闭 TUI 载体面）
+import { resolveHostCaps } from "../host/caps.ts"; // [aiti] host capability gating (turns TUI carrier surfaces off under pi-web)
 import { resolveCurrentSubagentCapabilityCeiling } from "../runs/shared/capability-ceiling.ts";
 import { loadConfig, resolveAsyncByDefault, resolveScheduledStoreRoot } from "./config.ts";
 import { buildSubagentToolDescription, buildSubagentToolPromptMetadata } from "./tool-description.ts";
@@ -299,12 +299,12 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 	setDeclarationPinning(pi, config.pinToolDeclarations !== false);
 	const waitToolConfig = resolveWaitToolConfig(config.waitTool);
 	const asyncByDefault = resolveAsyncByDefault(config);
-	const fleetViewEnabled = config.fleetView !== false && resolveHostCaps().tui; // [aiti] 非 TUI 宿主关闭（Web Fleet 面板替代）
+	const fleetViewEnabled = config.fleetView !== false && resolveHostCaps().tui; // [aiti] off on non-TUI hosts (the Web Fleet panel replaces it)
 	const slashCommandsEnabled = config.enableSlashCommands !== false;
 	// The detach shortcut is registered with the slash commands; a card must not advertise it when it is not.
 	const foregroundDetachShortcut = slashCommandsEnabled ? config.foregroundDetachShortcut : undefined;
 	const fleetViewPlacement = resolveFleetViewPlacement(config.fleetViewPlacement);
-	const asyncWidgetEnabled = config.asyncWidget !== false && resolveHostCaps().widget; // [aiti] 非 TUI 宿主关闭
+	const asyncWidgetEnabled = config.asyncWidget !== false && resolveHostCaps().widget; // [aiti] off on non-TUI hosts
 	const asyncWidgetCollapsed = config.asyncWidgetCollapsed === true;
 	const asyncWidgetLayout = config.asyncWidgetLayout ?? "adaptive";
 	const summaryInlineToolDisplay = config.inlineToolDisplay === "summary";
@@ -855,8 +855,8 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 		}
 	});
 
-	// [aiti] 非 TUI 宿主不注册 slash；上游清理链无条件调用 dispose（本文件下方），
-	// 禁用时给 no-op 句柄，保持上游原文零改动（0.59.0 起 registerSlashCommands 返回 dispose 句柄）
+	// [aiti] Non-TUI hosts do not register slash; the upstream cleanup chain calls dispose unconditionally (below in this file),
+	// so when disabled we hand back a no-op handle, keeping the upstream code verbatim (registerSlashCommands returns a dispose handle since 0.59.0)
 	const disposeSlashCommands = resolveHostCaps().slash && slashCommandsEnabled
 		? registerSlashCommands(pi, state, {
 			fleetKeybindings: config.fleetKeybindings,

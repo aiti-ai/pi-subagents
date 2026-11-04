@@ -1,15 +1,15 @@
 /**
- * [aiti] widget shim —— 引擎层（async-job-tracker）→ TUI 反向依赖的唯一转接板。
+ * [aiti] widget shim — adapter for the engine layer's (async-job-tracker) reverse dependency on TUI.
  *
- * 背景：上游 `runs/background/async-job-tracker.ts` import 了 `tui/render.ts` 的
- * renderWidget / widgetRenderKey，是引擎→TUI 全场唯一的反向依赖（拆包 PR① 的目标）。
- * 本 shim 让引擎侧 import 指向 host 层：
- *   - pi 宿主：两者都转发真实现，行为与上游逐字节一致。
- *   - pi-web 宿主：renderWidget no-op（Web Fleet 面板替代）；widgetRenderKey 仍转发——
- *     它是纯函数（状态 JSON 序列化），驱动后台任务的变更检测，关掉会破坏引擎行为。
+ * Background: upstream `runs/background/async-job-tracker.ts` imports renderWidget / widgetRenderKey from
+ * `tui/render.ts` — the only engine→TUI reverse dependency in the tree (target of packaging-split PR #1).
+ * This shim points the engine-side import at the host layer:
+ *   - pi host: both forward to the real implementation, byte-identical to upstream.
+ *   - pi-web host: renderWidget is a no-op (the Web Fleet panel replaces it); widgetRenderKey still forwards —
+ *     it is a pure function (state JSON serialization) driving change detection of background jobs; disabling it would break engine behavior.
  *
- * 注：本文件允许 import tui/*（L0 契约只约束 src/runs/**）；render.ts 顶层无副作用，
- * pi-web 的 node 进程可安全加载（组件类定义不触发终端渲染）。
+ * Note: this file may import tui/* (the L0 contract only constrains src/runs/**); render.ts has no top-level side effects,
+ * so pi-web's node process can safely load it (component class definitions do not trigger terminal rendering).
  */
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { renderWidget as renderTuiWidget, widgetRenderKey as tuiWidgetRenderKey } from "../../tui/render.ts";

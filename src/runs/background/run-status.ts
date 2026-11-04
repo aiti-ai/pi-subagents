@@ -3,7 +3,7 @@ import * as path from "node:path";
 import type { AgentToolResult } from "@earendil-works/pi-agent-core";
 import { safeTerminalText } from "../../shared/display-text.ts";
 import { getArtifactPaths, getArtifactsDir } from "../../shared/artifacts.ts";
-import { readFleetTranscript } from "../../host/shims/fleet-transcript.ts"; // [aiti] 引擎→TUI 反向依赖走 host shim
+import { readFleetTranscript } from "../../host/shims/fleet-transcript.ts"; // [aiti] engine→TUI reverse dependency routed via the host shim
 import { formatAsyncRunList, formatAsyncRunOutputPath, formatAsyncRunProgressLabel, formatWorkflowStageLine, listAsyncRuns } from "./async-status.ts";
 import { formatAsyncResultTranscript, formatAsyncRunTranscript, formatNestedRunTranscript, inspectSubagentFleet } from "./fleet-view.ts";
 import { formatNestedRunStatusLines } from "../shared/nested-render.ts";

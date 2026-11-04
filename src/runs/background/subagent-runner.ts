@@ -1093,7 +1093,7 @@ export async function runSingleStepInner(
 	let toolBudget = step.toolBudget ? initialToolBudgetState(step.toolBudget) : undefined;
 	let toolBudgetBlocked = false;
 	let actualLaunchContractDigest = step.launchContractDigest;
-	// A machine 'local' child edits this disk, so its local Git evidence is authoritative, as for an unplaced run. [aiti] 证据收集走 async
+	// A machine 'local' child edits this disk, so its local Git evidence is authoritative, as for an unplaced run. [aiti] evidence collection is async
 	const mutationSnapshot = step.machine && !isRexLocalMachine(step.machine) ? { source: "tracked-files" as const, trackedOnly: true as const, cwd: step.cwd ?? ctx.cwd, dirtyFiles: [], fingerprints: {}, unavailable: "Local Git evidence is not authoritative for a pane-native remote run." } : await snapshotTrackedMutations(step.cwd ?? ctx.cwd);
 	let finalMutationEvidence = await collectTrackedMutationEvidence(mutationSnapshot, step.cwd ?? ctx.cwd);
 

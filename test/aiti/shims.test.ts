@@ -1,8 +1,8 @@
 /**
- * [aiti] L1 widget shim —— pi-web 宿主屏蔽行为 + 纯函数转发一致性。
+ * [aiti] L1 widget shim — masking behavior on the pi-web host + pure-forwarding consistency.
  *
- * 注：本文件会加载 tui/render.ts（shim 静态 import），需要 @earendil-works/*
- * 在 node_modules 可解析（上游测试环境本就如此）。
+ * Note: this file loads tui/render.ts (static import in the shim), so @earendil-works/*
+ * must be resolvable from node_modules (the upstream test environment already satisfies this).
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
@@ -22,7 +22,7 @@ function withHost(value, fn) {
 
 const JOB_A = {
 	asyncDir: "/tmp/a",
-	asyncId: "aaaaaaaa-1111-2222-3333-444444444444", // [aiti] 0.59 起上游 lane 渲染路径读此字段（projectAsyncLane → asyncId.slice）
+	asyncId: "aaaaaaaa-1111-2222-3333-444444444444", // [aiti] since 0.59 the upstream lane rendering path reads this field (projectAsyncLane → asyncId.slice)
 	status: "running",
 	activityState: "active",
 	lastActivityAt: 1000,
@@ -35,23 +35,23 @@ const JOB_A = {
 	agents: ["scout"],
 };
 
-test("L1-6a: pi-web 宿主下 renderWidget 为 no-op（不碰 ctx、不抛）", () => {
+test("L1-6a: renderWidget is a no-op on the pi-web host (does not touch ctx, does not throw)", () => {
 	withHost("pi-web", () => {
-		// ctx 传 undefined：no-op 分支不得触碰参数
+		// ctx passed as undefined: the no-op branch must not touch its arguments
 		assert.doesNotThrow(() => renderWidget(undefined, [JOB_A]));
 		assert.doesNotThrow(() => renderWidget(undefined, []));
 	});
 });
 
-test("L1-6b: widgetRenderKey 稳定且区分状态（变更检测语义，与上游实现一致）", () => {
+test("L1-6b: widgetRenderKey is stable and distinguishes state (change-detection semantics, same as upstream)", () => {
 	const keyA1 = widgetRenderKey(JOB_A, false);
-	assert.equal(widgetRenderKey(JOB_A, false), keyA1, "同状态两次调用必须同 key");
-	assert.notEqual(widgetRenderKey({ ...JOB_A, status: "completed" }, false), keyA1, "状态变化必须换 key");
+	assert.equal(widgetRenderKey(JOB_A, false), keyA1, "two calls with the same state must produce the same key");
+	assert.notEqual(widgetRenderKey({ ...JOB_A, status: "completed" }, false), keyA1, "a state change must change the key");
 	const withAgents = { ...JOB_A, agents: ["worker"] };
-	assert.notEqual(widgetRenderKey(withAgents, false), keyA1, "agents 列表变化必须换 key");
+	assert.notEqual(widgetRenderKey(withAgents, false), keyA1, "an agents list change must change the key");
 });
 
-test("L1-6c: 两宿主下 widgetRenderKey 输出一致（转发不改语义）", () => {
+test("L1-6c: widgetRenderKey output is identical under both hosts (forwarding does not change semantics)", () => {
 	let keyPi, keyWeb;
 	withHost("pi", () => {
 		keyPi = widgetRenderKey(JOB_A, true);
@@ -59,5 +59,5 @@ test("L1-6c: 两宿主下 widgetRenderKey 输出一致（转发不改语义）",
 	withHost("pi-web", () => {
 		keyWeb = widgetRenderKey(JOB_A, true);
 	});
-	assert.equal(keyPi, keyWeb, "widgetRenderKey 是纯函数，宿主无关");
+	assert.equal(keyPi, keyWeb, "widgetRenderKey is a pure function, host-independent");
 });

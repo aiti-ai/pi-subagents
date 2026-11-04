@@ -1,5 +1,5 @@
 /**
- * [aiti] L1 宿主探测与能力表 —— 行为矩阵测试。
+ * [aiti] L1 host detection and capability table — behavior matrix tests.
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
@@ -20,7 +20,7 @@ function withEnv(value, fn) {
 	}
 }
 
-test("L1-5a: 缺省宿主 = pi（上游零感知）", () => {
+test("L1-5a: default host = pi (zero upstream awareness)", () => {
 	withEnv(undefined, () => {
 		assert.equal(detectHost(), "pi");
 		assert.equal(isPiWebHost(), false);
@@ -28,29 +28,29 @@ test("L1-5a: 缺省宿主 = pi（上游零感知）", () => {
 	});
 });
 
-test("L1-5b: 显式 pi-web / web（大小写不敏感）→ pi-web caps", () => {
+test("L1-5b: explicit pi-web / web (case-insensitive) → pi-web caps", () => {
 	for (const value of ["pi-web", "web", "PI-WEB", " Web "]) {
 		withEnv(value, () => {
-			assert.equal(detectHost(), "pi-web", `值 ${JSON.stringify(value)} 应识别为 pi-web`);
+			assert.equal(detectHost(), "pi-web", `value ${JSON.stringify(value)} should be recognized as pi-web`);
 			assert.equal(isPiWebHost(), true);
 		});
 	}
 });
 
-test("L1-5c: 无效值保守回退 pi（宁可走上游全功能路径，不可误判）", () => {
+test("L1-5c: invalid values conservatively fall back to pi (prefer the full upstream path over misclassification)", () => {
 	for (const value of ["", "unknown", "piweb", "next", "browser"]) {
-		withEnv(value, () => assert.equal(detectHost(), "pi", `值 ${JSON.stringify(value)} 应回退 pi`));
+		withEnv(value, () => assert.equal(detectHost(), "pi", `value ${JSON.stringify(value)} should fall back to pi`));
 	}
 });
 
-test("L1-5d: caps 矩阵——pi 全开 / pi-web 全关 / 仅声明载体面（core 不参与）", () => {
+test("L1-5d: caps matrix — pi all on / pi-web all off / declared carrier surfaces only (core not involved)", () => {
 	for (const key of CAP_KEYS) {
-		assert.equal(PI_HOST_CAPS[key], true, `pi caps.${key} 应为 true`);
-		assert.equal(PI_WEB_HOST_CAPS[key], false, `pi-web caps.${key} 应为 false`);
+		assert.equal(PI_HOST_CAPS[key], true, `pi caps.${key} should be true`);
+		assert.equal(PI_WEB_HOST_CAPS[key], false, `pi-web caps.${key} should be false`);
 	}
 });
 
-test("L1-5e: resolveHostCaps 可传参（无全局状态，可测试性）", () => {
+test("L1-5e: resolveHostCaps accepts an argument (no global state, testable)", () => {
 	assert.deepEqual(resolveHostCaps("pi-web"), PI_WEB_HOST_CAPS);
 	assert.deepEqual(resolveHostCaps("pi"), PI_HOST_CAPS);
 });
