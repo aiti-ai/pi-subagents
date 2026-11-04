@@ -11,6 +11,8 @@ import { createRunFanoutBudget } from "../../src/runs/shared/run-fanout-budget.t
 import { WAIT_TOOL_DEFAULT_TIMEOUT_MS_ENV, WAIT_TOOL_ENABLED_ENV, resolveWaitToolConfig, waitForSubagents, type SubagentWaitDeps } from "../../src/runs/background/subagent-wait.ts";
 import { recordWaitCompletion } from "../../src/runs/background/wait-completions.ts";
 import type { AsyncStatus, SubagentState } from "../../src/shared/types.ts";
+import { recoveryDescriptorPath } from "../../src/runs/shared/run-launch-folder.ts";
+import { writeFileCreatingDir } from "../support/helpers.ts";
 
 function writeStatus(asyncRoot: string, runId: string, state: AsyncStatus["state"], extra: object = {}): void {
 	const dir = path.join(asyncRoot, runId);
@@ -35,7 +37,7 @@ function writeStatus(asyncRoot: string, runId: string, state: AsyncStatus["state
 }
 
 function writeRecoveryDescriptor(asyncRoot: string, runId: string, agent: string, sessionFile: string, cwd: string): void {
-	fs.writeFileSync(path.join(asyncRoot, runId, "recovery-descriptor.json"), JSON.stringify({
+	writeFileCreatingDir(recoveryDescriptorPath(asyncRoot, runId), JSON.stringify({
 		version: 1,
 		sourceRunId: runId,
 		agent,
@@ -732,6 +734,24 @@ describe("bg_wait tool", () => {
 		} finally {
 			fs.rmSync(root, { recursive: true, force: true });
 		}
+	});
+
+	it("tells the caller how to wait through attention that is not a supervisor request", async (t) => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-wait-attn-hint-"));
+		t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+		const asyncRoot = path.join(root, "runs");
+		const state = makeState("sess-1");
+		const hint = /still running and none is waiting on a supervisor reply\. To keep waiting through this kind of attention, call bg_wait again with stopOnAttention: false/;
+
+		writeStatus(asyncRoot, "run-a", "running", { sessionId: "sess-1", pid: 999999, activityState: "needs_attention", currentTool: "bash" });
+		const watchdog = await waitForSubagents({ id: "run-a" }, undefined, baseDeps(root, state));
+		assert.match(textOf(watchdog), /attention required/);
+		assert.match(textOf(watchdog), hint);
+
+		writeStatus(asyncRoot, "run-a", "running", { sessionId: "sess-1", pid: 999999, activityState: "needs_attention", currentTool: "contact_supervisor" });
+		const supervisor = await waitForSubagents({ id: "run-a" }, undefined, baseDeps(root, state));
+		assert.match(textOf(supervisor), /Reply to any pending supervisor request/);
+		assert.doesNotMatch(textOf(supervisor), hint);
 	});
 
 	it("still stops tolerant waits for supervisor attention", async () => {

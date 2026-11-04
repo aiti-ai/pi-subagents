@@ -66,6 +66,53 @@ describe("async runner execution", () => {
 		assert.match(rejected.error, /managed worktrees are local git operations/u);
 	});
 
+	it("tells a child on a Herdr machine to return its output instead of writing a parent-side path", { skip: process.platform === "win32" ? "Herdr saved-machine launches are unsupported on Windows" : undefined }, (t) => {
+		const bin = fs.mkdtempSync(path.join(os.tmpdir(), "herdr-bin-"));
+		const herdr = path.join(bin, "herdr");
+		fs.writeFileSync(herdr, "#!/bin/sh\necho '[{\"id\":\"machine-1\",\"label\":\"workmac\",\"target\":\"host.example\",\"enabled\":true}]'\n", { mode: 0o755 });
+		const previousHerdrBin = process.env.HERDR_BIN;
+		process.env.HERDR_BIN = herdr;
+		t.after(() => {
+			if (previousHerdrBin === undefined) delete process.env.HERDR_BIN;
+			else process.env.HERDR_BIN = previousHerdrBin;
+			fs.rmSync(bin, { recursive: true, force: true });
+		});
+		const built = buildAsyncRunnerSteps("herdr-output", {
+			chain: [{ agent: "worker", task: "Inspect", machine: "workmac", cwd: "/remote/repo", output: "/parent/report.md" }],
+			agents: [{ ...agent("worker"), tools: ["read", "write"] }],
+			ctx,
+			asyncDir: path.join(bin, "async"),
+			maxSubagentDepth: 1,
+		});
+		assert.ok("steps" in built, "error" in built ? built.error : undefined);
+		const step = built.steps[0];
+		assert.ok(step && "task" in step);
+		assert.match(step.task, /Return the complete artifact in your final response\./u);
+		assert.doesNotMatch(step.task, /Write your findings to/u);
+	});
+
+	it("resolves machine 'local' to the parent's Rex session at the async step call site", { skip: process.platform === "win32" ? "Rex placement is POSIX-only" : undefined }, (t) => {
+		const bin = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "rex-bin-")));
+		fs.writeFileSync(path.join(bin, "rex"), "#!/bin/sh\ncase \"$*\" in *\" session inspect session:parent-1 \"*) echo '{\"session_id\":\"session:parent-1\"}';; *) exit 9;; esac\n", { mode: 0o755 });
+		const names = ["REX_BIN_DIR", "REX_SESSION", "REX_SERVER", "HERDR_BIN"] as const, previous = names.map((name) => process.env[name]);
+		Object.assign(process.env, { REX_BIN_DIR: bin, REX_SESSION: "session:parent-1", REX_SERVER: "unix:///tmp/parent-rex.sock", HERDR_BIN: path.join(bin, "no-herdr") });
+		t.after(() => {
+			names.forEach((name, index) => { const value = previous[index]; if (value === undefined) delete process.env[name]; else process.env[name] = value; });
+			fs.rmSync(bin, { recursive: true, force: true });
+		});
+		const built = buildAsyncRunnerSteps("local-machine", {
+			chain: [{ agent: "worker", task: "Inspect", machine: "local" }],
+			agents: [agent("worker")],
+			ctx: { ...ctx, cwd: bin },
+			asyncDir: path.join(bin, "async"),
+			maxSubagentDepth: 1,
+		});
+		assert.ok("steps" in built, "error" in built ? built.error : undefined);
+		const step = built.steps[0];
+		assert.ok(step && "machine" in step);
+		assert.deepEqual(step.machine, { provider: "rex", id: "local", session: "session:parent-1", server: "unix:///tmp/parent-rex.sock", cwd: bin });
+	});
+
 	it("uses supplied discovery context for missing async agents", () => {
 		const result = buildAsyncRunnerSteps("missing-agent", {
 			chain: [{ agent: "missing", task: "Do not launch" }],

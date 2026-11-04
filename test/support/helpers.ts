@@ -213,7 +213,7 @@ export const events = {
 				},
 			},
 			{
-				type: "tool_result_end",
+				type: "message_end",
 				message: {
 					role: "toolResult",
 					toolCallId: id,
@@ -235,7 +235,7 @@ export const events = {
 
 	toolResult(toolName: string, text: string, isError = false): object {
 		return {
-			type: "tool_result_end",
+			type: "message_end",
 			message: {
 				role: "toolResult",
 				toolName,
@@ -245,3 +245,9 @@ export const events = {
 		};
 	},
 };
+
+/** Writes a file, creating its folder; recovery descriptors live in a launch folder outside the run folder. */
+export function writeFileCreatingDir(filePath: string, data: string, encoding: BufferEncoding = "utf-8"): void {
+	fs.mkdirSync(path.dirname(filePath), { recursive: true });
+	fs.writeFileSync(filePath, data, encoding);
+}

@@ -10,6 +10,8 @@ import { recordWaitCompletion } from "../../src/runs/background/wait-completions
 import { inspectSubagentStatus } from "../../src/runs/background/run-status.ts";
 import { createRunFanoutBudget } from "../../src/runs/shared/run-fanout-budget.ts";
 import { SUBAGENT_ASYNC_COMPLETE_EVENT, type IntercomEventBus, type SubagentState } from "../../src/shared/types.ts";
+import { recoveryDescriptorPath } from "../../src/runs/shared/run-launch-folder.ts";
+import { writeFileCreatingDir } from "../support/helpers.ts";
 
 function writeStatus(asyncRoot: string, runId: string, state: string, extra: object = {}): void {
 	const dir = path.join(asyncRoot, runId);
@@ -27,7 +29,7 @@ function writeStatus(asyncRoot: string, runId: string, state: string, extra: obj
 }
 
 function writeRecoveryDescriptor(asyncRoot: string, runId: string, agent: string, sessionFile: string, cwd: string): void {
-	fs.writeFileSync(path.join(asyncRoot, runId, "recovery-descriptor.json"), JSON.stringify({
+	writeFileCreatingDir(recoveryDescriptorPath(asyncRoot, runId), JSON.stringify({
 		version: 1,
 		sourceRunId: runId,
 		agent,
@@ -492,7 +494,7 @@ describe("non-blocking wait subscriptions", () => {
 			manager.arm({ targetKind: "async", runId: "run-timeout", requestedId: "run-timeout", timeoutMs: 100 });
 			now = 1_101;
 			manager.reconcile();
-			assert.match(sent.shift() ?? "", /timed out/);
+			assert.match(sent.shift() ?? "", /timed out[\s\S]*Parent action: Check the run status/, "a wait with no saved results points at the run status");
 			assert.equal(state.asyncJobs.size, 0);
 			assert.equal(state.waitSubscriptions?.size, 0);
 		} finally {

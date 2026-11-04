@@ -27,9 +27,9 @@ import { discoverAvailableSkills, resolveSkills } from "./skills.ts";
 import {
 	buildProactiveSkillSubagentRecommendationLines,
 } from "./proactive-skills.ts";
-import { parseFrontmatter, parseFrontmatterList } from "./frontmatter.ts";
-import { resolveEffectiveThinking, toModelInfo } from "../shared/model-info.ts";
-import { resolveSubagentModelOverride, type ParentModel } from "../runs/shared/model-resolution.ts";
+import { parseFrontmatter, parseUnquotedList } from "./frontmatter.ts";
+import { resolveEffectiveThinking, THINKING_LEVELS, toModelInfo } from "../shared/model-info.ts";
+import { isUnavailableSubagentModel, resolveSubagentModelOverride, type ParentModel } from "../runs/shared/model-resolution.ts";
 import { validateToolBudgetConfig } from "../runs/shared/tool-budget.ts";
 import { formatReviewGateLabel, validateAcceptanceInput } from "../runs/shared/acceptance.ts";
 import { CODE_OWNED_EXTERNAL_CLI_ADAPTER_LABEL, isCodeOwnedExternalCliAdapterId, resolveExternalCliRunnerStatus, validateCodeOwnedProfileRunner } from "../runs/shared/external-cli-contract.ts";
@@ -43,7 +43,7 @@ import { listExternalJobProviders } from "../api/external-job-provider.ts";
 
 type ManagementAction = "list" | "get" | "models" | "create" | "update" | "delete" | "eject" | "disable" | "enable" | "reset";
 type ManagementScope = "user" | "project";
-type ManagementContext = Pick<ExtensionContext, "cwd" | "modelRegistry"> & { model?: ExtensionContext["model"]; config?: ExtensionConfig; currentSessionId?: string; runtimeAgentOwner?: RuntimeAgentOwner; onAgentsChanged?: () => void; discoverAgentsAll?: typeof discoverAgentsAll };
+type ManagementContext = Pick<ExtensionContext, "cwd" | "modelRegistry"> & { model?: ExtensionContext["model"]; config?: ExtensionConfig; piSessionId?: string; runtimeAgentOwner?: RuntimeAgentOwner; onAgentsChanged?: () => void; discoverAgentsAll?: typeof discoverAgentsAll };
 
 function discoverCatalog(ctx: ManagementContext, cwd: string = ctx.cwd, provider?: string): AgentDiscoveryAllResult {
 	return (ctx.discoverAgentsAll ?? discoverAgentsAll)(cwd, provider);
@@ -244,9 +244,9 @@ function withDeclaredExtensionPaths(config: AgentConfig, filePath: string): Agen
 	const { extensions: _extensions, subagentOnlyExtensions: _subagentOnlyExtensions, ...withoutResolvedExtensions } = config;
 	return {
 		...withoutResolvedExtensions,
-		...(frontmatter.extensions !== undefined ? { extensions: parseFrontmatterList(frontmatter.extensions) } : {}),
+		...(frontmatter.extensions !== undefined ? { extensions: parseUnquotedList(frontmatter.extensions) } : {}),
 		...(frontmatter.subagentOnlyExtensions !== undefined
-			? { subagentOnlyExtensions: parseFrontmatterList(frontmatter.subagentOnlyExtensions) }
+			? { subagentOnlyExtensions: parseUnquotedList(frontmatter.subagentOnlyExtensions) }
 			: {}),
 	};
 }
@@ -361,10 +361,7 @@ export function preservedAgentFrontmatterFields(agent: AgentConfig, cfg: Record<
 	if (hasKey(cfg, "extensions")) changed("extensions");
 	if (hasKey(cfg, "subagentOnlyExtensions")) changed("subagentOnlyExtensions");
 	if (hasKey(cfg, "mutationTools")) changed("mutationTools");
-	if (hasKey(cfg, "thinking")) {
-		changed("thinking");
-		if (cfg.thinking === "off") fields.add("thinking");
-	}
+	if (hasKey(cfg, "thinking")) changed("thinking");
 	if (hasKey(cfg, "systemPromptMode")) {
 		changed("systemPromptMode");
 		fields.add("systemPromptMode");
@@ -528,12 +525,11 @@ function applyAgentConfig(target: AgentConfig, cfg: Record<string, unknown>): st
 		else return "config.mutationTools must be a comma-separated string, empty string, or false when provided.";
 	}
 	if (hasKey(cfg, "thinking")) {
-		if (cfg.thinking === false || cfg.thinking === "") delete target.thinking;
-		else if (typeof cfg.thinking === "string") {
-			const thinking = cfg.thinking.trim();
-			if (thinking) target.thinking = thinking;
-			else delete target.thinking;
-		} else return "config.thinking must be a string or false when provided.";
+		const thinking = typeof cfg.thinking === "string" ? cfg.thinking.trim() : cfg.thinking;
+		const level = THINKING_LEVELS.find((candidate) => candidate === thinking);
+		if (thinking === false || thinking === "") delete target.thinking;
+		else if (level) target.thinking = level;
+		else return `config.thinking must be one of ${THINKING_LEVELS.join(", ")}, or false when provided.`;
 	}
 	if (hasKey(cfg, "systemPromptMode")) {
 		if (cfg.systemPromptMode === "append" || cfg.systemPromptMode === "replace") target.systemPromptMode = cfg.systemPromptMode;
@@ -738,7 +734,9 @@ function formatAgentListLine(agent: AgentConfig, providerNames: Set<string> | un
 	return `- ${agent.name} (${agentListMetadata(agent, providerNames)}): ${agent.description}`;
 }
 
-function formatAgentCapabilitiesLine(agent: AgentConfig, providerNames: Set<string> | undefined, externalCliAvailability?: ExternalCliAvailabilityByCommand): string {
+const UNAVAILABLE_MODEL_MARKER = "(unavailable in the active model registry)";
+
+function formatAgentCapabilitiesLine(agent: AgentConfig, providerNames: Set<string> | undefined, externalCliAvailability: ExternalCliAvailabilityByCommand | undefined, unavailableModels: Set<AgentConfig>): string {
 	const declaredTools = [
 		...(agent.tools ?? []),
 		...(agent.mcpDirectTools ?? []).map((tool) => `mcp:${tool}`),
@@ -754,6 +752,7 @@ function formatAgentCapabilitiesLine(agent: AgentConfig, providerNames: Set<stri
 	if (agent.model !== undefined) {
 		model = agent.model;
 		if (agent.modelProvider && !agent.model.includes("/")) model = `${agent.modelProvider}/${agent.model}`;
+		if (unavailableModels.has(agent)) model = `${model} ${UNAVAILABLE_MODEL_MARKER}`;
 	}
 	const thinking = agent.thinking === false ? "off" : agent.thinking ?? "default";
 	const machine = agent.machine ? `; Machine: ${agent.machine} (saved Herdr placement)` : "";
@@ -825,7 +824,7 @@ function agentCapabilityTools(agent: AgentConfig): AgentCapabilityRow["tools"] {
 	};
 }
 
-function agentCapabilityRow(agent: AgentConfig, options: { executable: boolean; providerNames?: Set<string>; externalCliAvailability: ExternalCliAvailabilityByCommand; restrictionSources?: string[] }): AgentCapabilityRow {
+function agentCapabilityRow(agent: AgentConfig, options: { executable: boolean; providerNames?: Set<string>; externalCliAvailability: ExternalCliAvailabilityByCommand; unavailableModels: Set<AgentConfig>; restrictionSources?: string[] }): AgentCapabilityRow {
 	return {
 		name: agent.name,
 		description: previewDisplayText(agent.description, 1000),
@@ -835,7 +834,7 @@ function agentCapabilityRow(agent: AgentConfig, options: { executable: boolean; 
 		aliases: agent.aliases ? [...agent.aliases] : undefined,
 		runner: agentCapabilityRunner(agent, options.providerNames, options.externalCliAvailability),
 		tools: agentCapabilityTools(agent),
-		model: presentDetails({ value: agent.model, thinking: agent.thinking }),
+		model: presentDetails({ value: agent.model, thinking: agent.thinking, ...(options.unavailableModels.has(agent) ? { unavailable: true as const } : {}) }),
 		execution: presentDetails({ defaultAsync: agent.defaultAsync, timeoutMs: agent.defaultTimeoutMs }),
 		acceptance: presentDetails({ policy: agent.defaultAcceptance, role: agent.acceptanceRole }),
 		output: presentDetails({ path: agent.output, mode: agent.outputMode }),
@@ -843,11 +842,11 @@ function agentCapabilityRow(agent: AgentConfig, options: { executable: boolean; 
 	};
 }
 
-function agentCapabilitiesSnapshot(input: { agents: AgentConfig[]; restrictedAgents: AgentConfig[]; providerNames?: Set<string>; externalCliAvailability: ExternalCliAvailabilityByCommand; restrictedSources?: string[] }): AgentCapabilitiesSnapshot {
+function agentCapabilitiesSnapshot(input: { agents: AgentConfig[]; restrictedAgents: AgentConfig[]; providerNames?: Set<string>; externalCliAvailability: ExternalCliAvailabilityByCommand; unavailableModels: Set<AgentConfig>; restrictedSources?: string[] }): AgentCapabilitiesSnapshot {
 	return {
 		agents: [
-			...input.agents.map((agent) => agentCapabilityRow(agent, { executable: true, providerNames: input.providerNames, externalCliAvailability: input.externalCliAvailability })),
-			...input.restrictedAgents.map((agent) => agentCapabilityRow(agent, { executable: false, providerNames: input.providerNames, externalCliAvailability: input.externalCliAvailability, restrictionSources: input.restrictedSources })),
+			...input.agents.map((agent) => agentCapabilityRow(agent, { executable: true, providerNames: input.providerNames, externalCliAvailability: input.externalCliAvailability, unavailableModels: input.unavailableModels })),
+			...input.restrictedAgents.map((agent) => agentCapabilityRow(agent, { executable: false, providerNames: input.providerNames, externalCliAvailability: input.externalCliAvailability, unavailableModels: input.unavailableModels, restrictionSources: input.restrictedSources })),
 		],
 		restrictedCount: input.restrictedAgents.length,
 		...(input.restrictedSources?.length ? { capabilityCeilingSources: [...input.restrictedSources] } : {}),
@@ -881,7 +880,7 @@ function appendAgentDiagnosticLines(lines: string[], diagnostics: AgentDiscovery
 	);
 }
 
-function agentCapabilityDetails(input: { capabilityMode: boolean; agents: AgentConfig[]; restrictedAgents: AgentConfig[]; providerNames?: Set<string>; externalCliAvailability: ExternalCliAvailabilityByCommand; restrictedSources?: string[] }): Partial<Details> | undefined {
+function agentCapabilityDetails(input: { capabilityMode: boolean; agents: AgentConfig[]; restrictedAgents: AgentConfig[]; providerNames?: Set<string>; externalCliAvailability: ExternalCliAvailabilityByCommand; unavailableModels: Set<AgentConfig>; restrictedSources?: string[] }): Partial<Details> | undefined {
 	if (!input.capabilityMode) return undefined;
 	return {
 		agentCapabilities: jsonDetails(agentCapabilitiesSnapshot({
@@ -889,6 +888,7 @@ function agentCapabilityDetails(input: { capabilityMode: boolean; agents: AgentC
 			restrictedAgents: input.restrictedAgents,
 			providerNames: input.providerNames,
 			externalCliAvailability: input.externalCliAvailability,
+			unavailableModels: input.unavailableModels,
 			restrictedSources: input.restrictedSources,
 		})),
 	};
@@ -979,7 +979,7 @@ export function handleList(params: ManagementParams, ctx: ManagementContext): Ag
 	let scopedAgents = effectiveAgentsForScope(scope, d, ctx.runtimeAgentOwner, ctx.model?.provider);
 	scopedAgents = scopedAgents
 		.sort((a, b) => a.name.localeCompare(b.name));
-	const capabilityCeiling = resolveCurrentSubagentCapabilityCeiling(ctx.currentSessionId);
+	const capabilityCeiling = resolveCurrentSubagentCapabilityCeiling(ctx.piSessionId);
 	const visibleAgents = scopedAgents.filter((a) => !a.disabled);
 	const agents = visibleAgents.filter((a) => isAgentAllowedByCapabilityCeiling(a.name, capabilityCeiling));
 	const restrictedAgents = visibleAgents.filter((a) => !isAgentAllowedByCapabilityCeiling(a.name, capabilityCeiling));
@@ -993,8 +993,11 @@ export function handleList(params: ManagementParams, ctx: ManagementContext): Ag
 	const providerNameSet = providerNames(providerStatus);
 	const capabilityMode = params.capabilities === true;
 	const externalCliAvailability = capabilityMode ? externalCliAvailabilityForAgents([...agents, ...restrictedAgents]) : undefined;
+	const availableModels = capabilityMode ? ctx.modelRegistry.getAvailable().map(toModelInfo) : [];
+	const unavailableModels = new Set([...agents, ...restrictedAgents].filter((agent) => (agent.runner === undefined || agent.runner.type === "pi")
+		&& isUnavailableSubagentModel(agent.model, availableModels, agent.modelProvider ?? ctx.model?.provider)));
 	const formatLine = capabilityMode
-		? (agent: AgentConfig, names: Set<string> | undefined) => formatAgentCapabilitiesLine(agent, names, externalCliAvailability)
+		? (agent: AgentConfig, names: Set<string> | undefined) => formatAgentCapabilitiesLine(agent, names, externalCliAvailability, unavailableModels)
 		: formatAgentListLine;
 	const lines = [
 		capabilityMode ? "Executable agents (capabilities):" : "Executable agents:",
@@ -1010,13 +1013,21 @@ export function handleList(params: ManagementParams, ctx: ManagementContext): Ag
 		restrictedAgents,
 		providerNames: providerNameSet,
 		externalCliAvailability: externalCliAvailability ?? new Map(),
+		unavailableModels,
 		restrictedSources,
 	}));
 }
 
+// User then project overrides are layered, so the override's top-level scope can name a file that did not set `model`.
+function modelOverrideFile(override: NonNullable<AgentConfig["override"]>): { scope: "user" | "project"; path: string } {
+	const scopes = override.fieldScopes?.model;
+	const scope = scopes?.includes("project") ? "project" : scopes?.includes("user") ? "user" : override.scope;
+	return { scope, path: override.paths?.[scope] ?? override.path };
+}
+
 function formatModelSource(agent: AgentConfig, currentModel: ParentModel | undefined): string {
 	if (agent.override && agent.model !== agent.override.base.model) {
-		return `${agent.override.scope} override`;
+		return `${modelOverrideFile(agent.override).scope} override`;
 	}
 	if (agent.modelSource?.type === "subagents.defaultModel" && agent.model === agent.modelSource.model) {
 		return `${agent.modelSource.scope} defaultModel`;
@@ -1037,7 +1048,7 @@ function handleModels(params: ManagementParams, ctx: ManagementContext): AgentTo
 	const availableModels = ctx.modelRegistry.getAvailable().map(toModelInfo);
 	const currentModel = ctx.model ? { provider: ctx.model.provider, id: ctx.model.id } : undefined;
 	const preferredProvider = ctx.model?.provider;
-	const capabilityCeiling = resolveCurrentSubagentCapabilityCeiling(ctx.currentSessionId);
+	const capabilityCeiling = resolveCurrentSubagentCapabilityCeiling(ctx.piSessionId);
 
 	let selectedAgents = effectiveAgents;
 	if (requestedAgent) {
@@ -1070,18 +1081,20 @@ function handleModels(params: ManagementParams, ctx: ManagementContext): AgentTo
 		: [{ agent, name: agent.name }, ...(agent.aliases ?? []).map((name) => ({ agent, name }))]);
 	for (const { agent, name } of modelEntries) {
 		const resolvedModel = resolveSubagentModelOverride(agent.model, currentModel, availableModels, agent.modelProvider ?? preferredProvider);
+		const shownModel = resolvedModel === undefined ? "(unresolved)"
+			: (agent.runner === undefined || agent.runner.type === "pi") && isUnavailableSubagentModel(agent.model, availableModels, agent.modelProvider ?? preferredProvider) ? `${resolvedModel} ${UNAVAILABLE_MODEL_MARKER}` : resolvedModel;
 		const effectiveThinking = resolveEffectiveThinking(resolvedModel, agent.thinking)
 			?? (agent.thinking === false ? "off" : undefined);
 		const source = `${formatModelSource(agent, currentModel)}${agent.disabled ? "; disabled" : ""}${isAgentAllowedByCapabilityCeiling(agent.name, capabilityCeiling) ? "" : "; restricted"}`;
 		if (requestedAgent) {
 			lines.push(`Agent: ${requestedAgent}`);
 			lines.push("Effective model:");
-			lines.push(`  ${resolvedModel ?? "(unresolved)"}`);
+			lines.push(`  ${shownModel}`);
 			lines.push(`Source: ${source}`);
 			lines.push(`Thinking: ${effectiveThinking ?? "default"}`);
 			if (agent.override) {
 				lines.push("Override file:");
-				lines.push(`  ${agent.override.path}`);
+				lines.push(`  ${modelOverrideFile(agent.override).path}`);
 			}
 			if (agent.model && resolvedModel && agent.model !== resolvedModel) {
 				lines.push("Requested model setting:");
@@ -1095,12 +1108,12 @@ function handleModels(params: ManagementParams, ctx: ManagementContext): AgentTo
 		}
 		lines.push(name);
 		lines.push("  model:");
-		lines.push(`    ${resolvedModel ?? "(unresolved)"}`);
+		lines.push(`    ${shownModel}`);
 		lines.push(`  source: ${source}`);
 		lines.push(`  thinking: ${effectiveThinking ?? "default"}`);
 		if (agent.override) {
 			lines.push("  override file:");
-			lines.push(`    ${agent.override.path}`);
+			lines.push(`    ${modelOverrideFile(agent.override).path}`);
 		}
 		if (agent.model && resolvedModel && agent.model !== resolvedModel) {
 			lines.push("  requested model setting:");
