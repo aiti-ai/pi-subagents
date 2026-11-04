@@ -126,8 +126,5 @@
   },
   "overrides": {
     "undici": "$undici"
-  },
-  "publishConfig": {
-    "registry": "https://npm.alot.pw"
   }
 }

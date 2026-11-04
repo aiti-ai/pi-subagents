@@ -53,7 +53,7 @@ test("L0-4: package.json publish surface is complete (@aiti-ai scope + -aiti.N v
 	const pkg = JSON.parse(await readFile(join(ROOT, "package.json"), "utf8"));
 	assert.equal(pkg.name, "@aiti-ai/pi-subagents", "package name must be the standalone @aiti-ai scope package");
 	assert.match(pkg.version, /^\d+\.\d+\.\d+-aiti\.\d+$/, "version must follow the upstream-baseline-aiti.N format");
-	assert.equal(pkg.publishConfig?.registry, "https://npm.alot.pw", "publishConfig must point at the internal registry");
+	assert.equal(pkg.publishConfig, undefined, "publishConfig must stay absent: publish routing is machine-level .npmrc plus an explicit --registry flag on the dist-pkg tarball, and the source root is private:true anyway");
 	assert.equal(pkg.exports["./host"], "./src/host/index.ts", "./host export must exist (the pi-web integration surface)");
 });
 
