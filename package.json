@@ -1,6 +1,6 @@
 {
   "name": "@aiti-ai/pi-subagents",
-  "version": "0.84.0-aiti.1",
+  "version": "0.84.1-aiti.1",
   "private": true,
   "description": "[aiti fork] Pi extension for single-agent delegation and scripted multi-agent workflows",
   "author": "Nico Bailon",

@@ -17,7 +17,6 @@ Main changes compared to upstream:
 - **Host capability layer** (`src/host/`): an opt-in `PI_SUBAGENTS_HOST=pi-web` switch turns off terminal-only surfaces (TUI fleet view, async widget, slash commands, watchdog UI, intercom channel, external integrations) so the same extension runs cleanly inside a web host. The `pi` default keeps behavior identical to upstream; the core engine surface is untouched and upstream's unit tests stay green under both caps.
 - **Engine-layer purity discipline**: `src/runs/**` must not import from `src/tui/` (enforced by a contract test). The two engine→TUI touch points (async-job-tracker's widget rendering, run-status transcript reading) go through thin shims in `src/host/shims/`.
 - **Async git evidence collection**: mutation evidence (`src/runs/shared/mutation-evidence.ts`) runs its git calls asynchronously and yields to the event loop while hashing large diffs, so embedding hosts never block on repository scans. `execFileSync`/`spawnSync` in extension code are treated as a performance red line.
-- **Configurable global concurrency cap**: `PI_SUBAGENTS_MAX_CONCURRENT` bounds concurrent child launches machine-wide (default unchanged) when no config value is set, on top of upstream's per-workflow `globalConcurrencyLimit`.
 - **Packaging**: ships TypeScript sources and exposes a stable `./host` subpath for embedding hosts.
 
 Generic improvements from this fork are candidates for upstream pull requests; each one is cleaned of fork-specific packaging before being proposed.
