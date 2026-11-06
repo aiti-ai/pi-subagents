@@ -474,6 +474,8 @@ Caps simultaneously running children inside one run, including durable legacy mu
 
 Inline or file-backed top-level workflow calls may set a positive safe-integer `globalConcurrencyLimit` to override this value for that workflow. The override is workflow-only and is not forwarded to child calls.
 
+Use this cap to protect upstream AI provider rate limits when a workflow fans out many children at once (e.g. `runs.all` with a dozen scouts): excess children queue at launch and start as live siblings finish, so they consume no model quota while waiting.
+
 ## `maxSubagentSpawnsPerSession`
 
 ```json

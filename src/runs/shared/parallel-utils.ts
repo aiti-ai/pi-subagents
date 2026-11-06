@@ -160,6 +160,23 @@ export function flattenSteps(steps: RunnerStep[]): RunnerSubagentStep[] {
 export const DEFAULT_GLOBAL_CONCURRENCY_LIMIT = 20;
 
 /**
+ * Resolve the effective global concurrency cap for simultaneously-running subagent
+ * children: explicit config value > built-in default. The cap follows upstream's
+ * single-path policy (VISION.md): set it via the extension config file
+ * (`globalConcurrencyLimit`) or per workflow — no environment override.
+ *
+ * Purpose (2026-10-10): protect upstream AI provider rate limits when a workflow
+ * fans out many children at once (e.g. runs.all with a dozen scouts).
+ */
+export function resolveEffectiveGlobalConcurrencyLimit(configured?: number): number {
+	if (configured !== undefined) {
+		if (!Number.isInteger(configured) || configured < 1) return DEFAULT_GLOBAL_CONCURRENCY_LIMIT;
+		return configured;
+	}
+	return DEFAULT_GLOBAL_CONCURRENCY_LIMIT;
+}
+
+/**
  * A promise-based semaphore for limiting concurrent access across multiple
  * mapConcurrent calls within a single run. Enforces a global cap on the total
  * number of subagent tasks executing simultaneously, regardless of each step's

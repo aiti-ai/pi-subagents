@@ -1,3 +1,5 @@
+// ⚠ The only remaining spawnSync is the powershell probe of windowsProcessStartKey (1s cap; stale-lock rare path);
+// the Linux path spawns nothing. Follow-up cleanup: docs/exec-sync-to-async-plan.md §8.
 import { execFileSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import * as fs from "node:fs";
@@ -54,13 +56,10 @@ function linuxProcessStartKey(pid: number): string | undefined {
 	}
 }
 
-function psProcessStartKey(pid: number): string | undefined {
-	try {
-		const raw = execFileSync("ps", ["-p", String(pid), "-o", "lstart="], { encoding: "utf-8", stdio: ["ignore", "pipe", "ignore"], timeout: 1000 }).trim();
-		return raw ? `ps:${raw}` : undefined;
-	} catch {
-		return undefined;
-	}
+// The ps fallback was removed (2026-09-12 execSync→async conversion): /proc is the sole authority for Linux process info;
+// if /proc/<pid>/stat is unreadable the process does not exist (ps would fail the same way) — a spawnSync("ps") fallback is a redundant spawn.
+function psProcessStartKey(_pid: number): string | undefined {
+	return undefined;
 }
 
 function windowsProcessStartKey(pid: number): string | undefined {
