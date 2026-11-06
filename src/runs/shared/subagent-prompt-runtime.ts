@@ -7,7 +7,7 @@ import { registerNativeSupervisorClient } from "../../intercom/native-supervisor
 import { permissionDecision } from "./permissions.ts";
 import type { SteerRequest } from "../background/control-channel.ts";
 import { RUNTIME_EXTENSION_ACK_EVENT, isRuntimeAcknowledgedExtensionId } from "./runtime-acknowledged-extensions.ts";
-import { createStructuredOutputToolParameters, MISSING_STRUCTURED_ACCEPTANCE_REPORT_ERROR, prepareStructuredOutputArguments, structuredOutputValidatorReady, validateStructuredOutputValue } from "./structured-output.ts";
+import { createStructuredOutputToolParameters, MISSING_STRUCTURED_ACCEPTANCE_REPORT_ERROR, prepareStructuredOutputArguments, validateStructuredOutputValue } from "./structured-output.ts";
 import { validateAcceptanceReport } from "./acceptance.ts";
 import { formatChildToolDiagnostic } from "./tool-availability.ts";
 import { shouldBlockToolForBudget, toolBudgetBlockedMessage, toolBudgetSoftNudge } from "./tool-budget.ts";
@@ -24,6 +24,7 @@ import { inheritedNestedRouteOf } from "./nested-events.ts";
 import { registerWaitTool } from "../background/wait-tool.ts";
 import { drainOutstandingWork } from "../background/auto-drain.ts";
 import { MODEL_ONLY_TOOL } from "../../shared/extension-context.ts";
+import { DEFAULT_WAIT_TOOL_NAME, setWaitToolName } from "../../shared/wait-tool-name.ts";
 import {
 	childSupervisorMetadata,
 	evaluateChildToolDiagnostic,
@@ -592,7 +593,6 @@ function registerStructuredOutputTool(pi: ExtensionAPI, structured: NonNullable<
 	const terminalState = structured.terminalState ??= { captured: false };
 	const required = structured.acceptanceReport === "required";
 	const parameters = createStructuredOutputToolParameters(structured.schema, { acceptanceReport: structured.acceptanceReport });
-	void structuredOutputValidatorReady();
 	const registerTool = pi.registerTool as unknown as (tool: {
 		name: string;
 		label: string;
@@ -633,7 +633,6 @@ function registerStructuredOutputTool(pi: ExtensionAPI, structured: NonNullable<
 	});
 }
 
-/** Register every child-side hook the prompt runtime owns for one child session. */
 export default function registerSubagentPromptRuntime(pi: ExtensionAPI, config?: ChildRuntimeConfig, drainObservation?: import("./readonly-drain-observation.ts").ReadonlyDrainObservation): void {
 	// A path-based load has no ChildRuntimeConfig. This can happen if an
 	// ambient-extension discovery path finds the runtime module in addition to
@@ -669,6 +668,7 @@ export default function registerSubagentPromptRuntime(pi: ExtensionAPI, config?:
 	} as unknown as SubagentState;
 	const nestedRootRunId = inheritedNestedRouteOf(config)?.rootRunId;
 	// fanout-child assigns config.hasPendingSupervisorRequest after this hook registers, so read it per wait.
+	setWaitToolName(config.waitTool.name ?? DEFAULT_WAIT_TOOL_NAME);
 	if (typeof pi.registerTool === "function") registerWaitTool(pi, waitState, config.waitTool.enabled, undefined, config.waitTool.defaultTimeoutMs, { nestedRootRunId }, () => config.hasPendingSupervisorRequest?.() === true);
 	const supervisorMetadata = childSupervisorMetadata(config);
 	let nativeSupervisorClientRegistered = false;

@@ -1,8 +1,9 @@
-import { execFile } from "node:child_process";
+import { execFile, execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { promisify } from "node:util";
 import type { ArtifactPaths, TimeoutRecoveryProjection, TimeoutRecoverySummary, TrackedMutationEvidence, TrackedMutationFingerprint, TrackedMutationSnapshot } from "../../shared/types.ts";
 
 const MAX_TRACKED_PATHS = 500;
@@ -14,41 +15,53 @@ function gitArguments(args: string[]): string[] {
 	return ["-c", "core.fsmonitor=false", ...args];
 }
 
-/**
- * Async git calls (2026-09-12 execSync→async conversion): error shape aligned with execFileSync (err.stdout/stderr).
- * Performance red line: execFileSync/spawnSync must never be reintroduced inside the pi extension process.
- */
-function gitOutput(cwd: string, args: string[], maxBuffer = MAX_HASH_BYTES): Promise<string> {
-	return new Promise((resolve, reject) => {
-		execFile("git", gitArguments(args), { cwd, encoding: "utf-8", maxBuffer, windowsHide: true }, (err, stdout) => {
-			if (err) { (err as Error & { stdout?: string }).stdout = typeof stdout === "string" ? stdout : ""; reject(err); }
-			else resolve(String(stdout ?? ""));
-		});
-	});
+function gitOutput(cwd: string, args: string[], maxBuffer = MAX_HASH_BYTES): string {
+	return execFileSync("git", gitArguments(args), { cwd, encoding: "utf-8", stdio: ["ignore", "pipe", "pipe"], maxBuffer, windowsHide: true });
+}
+
+const execFileAsync = promisify(execFile);
+
+/** The collection path runs while sibling children settle, so git runs off the event loop. */
+async function gitOutputAsync(cwd: string, args: string[]): Promise<string> {
+	return (await execFileAsync("git", gitArguments(args), { cwd, encoding: "utf-8", maxBuffer: MAX_HASH_BYTES, windowsHide: true })).stdout;
+}
+
+/** Yields to the event loop every 2 MiB so hashing a large diff does not stall other work. */
+async function hashFileAsync(diffPath: string): Promise<string> {
+	const hash = createHash("sha256");
+	const fd = fs.openSync(diffPath, "r");
+	try {
+		const buffer = Buffer.alloc(64 * 1024);
+		let chunks = 0;
+		for (;;) {
+			const bytesRead = fs.readSync(fd, buffer, 0, buffer.length, null);
+			if (bytesRead === 0) break;
+			hash.update(bytesRead === buffer.length ? buffer : buffer.subarray(0, bytesRead));
+			if (++chunks % 32 === 0) await new Promise<void>((resolve) => setImmediate(resolve));
+		}
+	} finally {
+		fs.closeSync(fd);
+	}
+	return hash.digest("hex");
 }
 
 function splitNul(output: string): string[] {
 	return output.split("\0").filter((part) => part.length > 0);
 }
 
-async function hashLargeDiff(cwd: string, relativePath: string): Promise<string> {
+function hashLargeDiff(cwd: string, relativePath: string): string {
 	const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-subagents-tracked-diff-"));
 	const diffPath = path.join(tempDir, "diff.patch");
 	try {
-		await new Promise<void>((resolve, reject) => {
-			execFile("git", gitArguments(["diff", "--no-ext-diff", "--binary", `--output=${diffPath}`, "HEAD", "--", relativePath]), { cwd, windowsHide: true }, (err: Error | null) => (err ? reject(err) : resolve()));
-		});
+		execFileSync("git", gitArguments(["diff", "--no-ext-diff", "--binary", `--output=${diffPath}`, "HEAD", "--", relativePath]), { cwd, stdio: "ignore", windowsHide: true });
 		const hash = createHash("sha256");
 		const buffer = Buffer.allocUnsafe(64 * 1024);
 		const fd = fs.openSync(diffPath, "r");
 		try {
-			let chunks = 0;
 			for (;;) {
 				const bytesRead = fs.readSync(fd, buffer, 0, buffer.length, null);
 				if (bytesRead === 0) break;
 				hash.update(buffer.subarray(0, bytesRead));
-				// Large-diff hashing yields to the event loop (2026-10-10): yield once every 32 chunks (~2MB) to avoid monopolizing it for long stretches.
-				if (++chunks % 32 === 0) await new Promise<void>((resolve) => setImmediate(resolve));
 			}
 		} finally {
 			fs.closeSync(fd);
@@ -59,17 +72,19 @@ async function hashLargeDiff(cwd: string, relativePath: string): Promise<string>
 	}
 }
 
-async function listChangedTrackedFiles(cwd: string): Promise<{ paths: string[]; truncated: boolean }> {
-	const paths = splitNul(await gitOutput(cwd, ["diff", "--no-ext-diff", "--name-only", "-z", "HEAD", "--"], MAX_HASH_BYTES));
+const CHANGED_FILES_ARGS = ["diff", "--no-ext-diff", "--name-only", "-z", "HEAD", "--"];
+
+function changedTrackedFiles(nameOnlyOutput: string): { paths: string[]; truncated: boolean } {
+	const paths = splitNul(nameOnlyOutput);
 	return { paths: paths.slice(0, MAX_TRACKED_PATHS), truncated: paths.length > MAX_TRACKED_PATHS };
 }
 
-async function fingerprintPath(cwd: string, relativePath: string): Promise<TrackedMutationFingerprint> {
+function fingerprintPath(cwd: string, relativePath: string): TrackedMutationFingerprint {
 	try {
-		const diff = await gitOutput(cwd, ["diff", "--no-ext-diff", "--binary", "HEAD", "--", relativePath], MAX_HASH_BYTES);
+		const diff = gitOutput(cwd, ["diff", "--no-ext-diff", "--binary", "HEAD", "--", relativePath], MAX_HASH_BYTES);
 		return { kind: "diff", digest: createHash("sha256").update(diff).digest("hex") };
 	} catch {
-		return { kind: "diff", digest: await hashLargeDiff(cwd, relativePath) };
+		return { kind: "diff", digest: hashLargeDiff(cwd, relativePath) };
 	}
 }
 
@@ -78,14 +93,30 @@ function sameFingerprint(left: TrackedMutationFingerprint | undefined, right: Tr
 	return left.digest === right.digest;
 }
 
-export async function snapshotTrackedMutations(cwd: string): Promise<TrackedMutationSnapshot> {
+export function snapshotTrackedMutations(cwd: string): TrackedMutationSnapshot {
 	try {
-		const changed = await listChangedTrackedFiles(cwd);
+		const changed = changedTrackedFiles(gitOutput(cwd, CHANGED_FILES_ARGS));
 		const fingerprints: Record<string, TrackedMutationFingerprint> = {};
-		for (const file of changed.paths) fingerprints[file] = await fingerprintPath(cwd, file);
+		for (const file of changed.paths) fingerprints[file] = fingerprintPath(cwd, file);
 		return { source: "tracked-files", trackedOnly: true, cwd, dirtyFiles: changed.paths, fingerprints, truncated: changed.truncated };
 	} catch (error) {
 		return { source: "tracked-files", trackedOnly: true, cwd, dirtyFiles: [], fingerprints: {}, unavailable: error instanceof Error ? error.message : String(error) };
+	}
+}
+
+async function fingerprintPathAsync(cwd: string, relativePath: string): Promise<TrackedMutationFingerprint> {
+	try {
+		const diff = await gitOutputAsync(cwd, ["diff", "--no-ext-diff", "--binary", "HEAD", "--", relativePath]);
+		return { kind: "diff", digest: createHash("sha256").update(diff).digest("hex") };
+	} catch {
+		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-mutation-evidence-"));
+		try {
+			const diffPath = path.join(tempDir, "diff.bin");
+			await gitOutputAsync(cwd, ["diff", "--no-ext-diff", "--binary", `--output=${diffPath}`, "HEAD", "--", relativePath]);
+			return { kind: "diff", digest: await hashFileAsync(diffPath) };
+		} finally {
+			fs.rmSync(tempDir, { recursive: true, force: true });
+		}
 	}
 }
 
@@ -94,7 +125,7 @@ export async function collectTrackedMutationEvidence(snapshot: TrackedMutationSn
 		return { source: "tracked-files", trackedOnly: true, changedFiles: [], attemptedMutation: false, unavailable: snapshot.unavailable };
 	}
 	try {
-		const current = await listChangedTrackedFiles(cwd);
+		const current = changedTrackedFiles(await gitOutputAsync(cwd, CHANGED_FILES_ARGS));
 		const startDirty = new Set(snapshot.dirtyFiles);
 		const candidates = new Set([...snapshot.dirtyFiles, ...current.paths]);
 		const changedFiles: string[] = [];
@@ -103,7 +134,7 @@ export async function collectTrackedMutationEvidence(snapshot: TrackedMutationSn
 				if (!snapshot.truncated) changedFiles.push(file);
 				continue;
 			}
-			if (!sameFingerprint(snapshot.fingerprints[file], await fingerprintPath(cwd, file))) changedFiles.push(file);
+			if (!sameFingerprint(snapshot.fingerprints[file], await fingerprintPathAsync(cwd, file))) changedFiles.push(file);
 		}
 		changedFiles.sort();
 		return {
