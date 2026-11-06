@@ -10,16 +10,15 @@
 
 ## About this fork
 
-This is [aiti-ai](https://github.com/aiti-ai)'s fork, published as `@aiti-ai/pi-subagents` for internal use. It exists to run pi-subagents as an embedded engine inside pi-web — a web-based Pi cockpit where subagent activity is surfaced through web panels instead of the terminal UI — while tracking upstream closely (merge-style sync of `upstream/main`; this branch is based on v0.84.0).
+This is [aiti-ai](https://github.com/aiti-ai)'s fork, published as `@aiti-ai/pi-subagents` for internal use. It exists to run pi-subagents as an embedded engine inside pi-web — a web-based Pi cockpit where subagent activity is surfaced through web panels instead of the terminal UI — while tracking upstream closely (merge-style sync of `upstream/main`; this branch is based on v0.86.0).
 
 Main changes compared to upstream:
 
-- **Host capability layer** (`src/host/`): an opt-in `PI_SUBAGENTS_HOST=pi-web` switch turns off terminal-only surfaces (TUI fleet view, async widget, slash commands, watchdog UI, intercom channel, external integrations) so the same extension runs cleanly inside a web host. The `pi` default keeps behavior identical to upstream; the core engine surface is untouched and upstream's unit tests stay green under both caps.
-- **Engine-layer purity discipline**: `src/runs/**` must not import from `src/tui/` (enforced by a contract test). The two engine→TUI touch points (async-job-tracker's widget rendering, run-status transcript reading) go through thin shims in `src/host/shims/`.
-- **Async git evidence collection**: mutation evidence (`src/runs/shared/mutation-evidence.ts`) runs its git calls asynchronously and yields to the event loop while hashing large diffs, so embedding hosts never block on repository scans. `execFileSync`/`spawnSync` in extension code are treated as a performance red line.
+- **Host capability layer** (`src/host/`): an opt-in `PI_SUBAGENTS_HOST=pi-web` switch turns off the terminal carrier surfaces — fleet view, async widget, and slash commands (the watchdog slash command is covered transitively by the slash gate). The `pi` default keeps behavior identical to upstream; the core engine surface is untouched and upstream's unit tests stay green under both caps. Intercom result delivery is already config-gated off by default upstream, and the herdr bridge is data-driven, so neither needs a separate gate.
+- **Engine-layer purity discipline**: `src/runs/**` must not import from `src/tui/` — co-enforced by upstream's own `engine-import-boundary` guard (landed in #3182). The one remaining engine→TUI touch point, async-job-tracker's widget rendering, routes through `src/host/shims/noop-widget.ts`: `renderWidget` no-ops on non-TUI hosts, while `widgetRenderKey` forwards unchanged (a pure change-detection function that must keep engine semantics). Transcript parsing needs no fork layer anymore: upstream moved it to `src/shared/fleet-transcript-reader.ts`.
 - **Packaging**: ships TypeScript sources and exposes a stable `./host` subpath for embedding hosts.
 
-Generic improvements from this fork are candidates for upstream pull requests; each one is cleaned of fork-specific packaging before being proposed.
+Generic improvements from this fork are candidates for upstream pull requests; each one is cleaned of fork-specific packaging before being proposed. Two have already landed upstream (#3182 transcript-parsing move, #3186 async mutation evidence), which is why they no longer appear as fork deltas above.
 
 ## Install
 
