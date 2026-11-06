@@ -61,6 +61,7 @@ import { createParentWake } from "../shared/parent-wake.ts";
 import { handleSubagentSteeringNotice, type SubagentSteeringMessageDetails } from "./steering-notices.ts";
 import { SUBAGENT_CHILD_ENV, SUBAGENT_PARENT_SESSION_ENV } from "../runs/shared/child-runtime-config.ts";
 import { disposeChildSessions } from "../runs/shared/child-session.ts";
+import { resolveHostCaps } from "../host/caps.ts"; // [aiti] host capability gating (turns TUI carrier surfaces off under pi-web)
 import { resolveCurrentSubagentCapabilityCeiling } from "../runs/shared/capability-ceiling.ts";
 import { loadConfig, resolveAsyncByDefault, resolveScheduledStoreRoot } from "./config.ts";
 import { buildSubagentToolDescription, buildSubagentToolPromptMetadata } from "./tool-description.ts";
@@ -287,12 +288,12 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 	const waitToolConfig = resolveWaitToolConfig(config.waitTool);
 	setWaitToolName(waitToolConfig.name ?? DEFAULT_WAIT_TOOL_NAME);
 	const asyncByDefault = resolveAsyncByDefault(config);
-	const fleetViewEnabled = config.fleetView !== false;
+	const fleetViewEnabled = config.fleetView !== false && resolveHostCaps().tui; // [aiti] off on non-TUI hosts (the Web Fleet panel replaces it)
 	const slashCommandsEnabled = config.enableSlashCommands !== false;
 	// The detach shortcut is registered with the slash commands; a card must not advertise it when it is not.
 	const foregroundDetachShortcut = slashCommandsEnabled ? config.foregroundDetachShortcut : undefined;
 	const fleetViewPlacement = resolveFleetViewPlacement(config.fleetViewPlacement);
-	const asyncWidgetEnabled = config.asyncWidget !== false;
+	const asyncWidgetEnabled = config.asyncWidget !== false && resolveHostCaps().widget; // [aiti] off on non-TUI hosts
 	const asyncWidgetCollapsed = config.asyncWidgetCollapsed === true;
 	const asyncWidgetLayout = config.asyncWidgetLayout ?? "adaptive";
 	const summaryInlineToolDisplay = config.inlineToolDisplay === "summary";
@@ -851,11 +852,15 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 		}
 	});
 
-	const disposeSlashCommands = slashCommandsEnabled ? registerSlashCommands(pi, state, {
-		fleetKeybindings: config.fleetKeybindings,
-		foregroundDetachShortcut,
-		workflowScriptsDisabled: disabledFeatures.features.has("workflow-scripts"),
-	}) : { dispose: () => {} };
+	// [aiti] Non-TUI hosts do not register slash; the upstream cleanup chain calls dispose unconditionally (below in this file),
+	// so when disabled we hand back a no-op handle, keeping the upstream code verbatim (registerSlashCommands returns a dispose handle since 0.59.0)
+	const disposeSlashCommands = resolveHostCaps().slash && slashCommandsEnabled
+		? registerSlashCommands(pi, state, {
+			fleetKeybindings: config.fleetKeybindings,
+			foregroundDetachShortcut,
+			workflowScriptsDisabled: disabledFeatures.features.has("workflow-scripts"),
+		})
+		: { dispose() {} };
 
 	let visibleControlNotices = new Set<string>();
 	const activeHerdrRuns = () => projectActiveHerdrRuns(state);
