@@ -1,0 +1,92 @@
+# publish-npm.yml — publish @aiti-ai/pi-subagents to the npm official registry
+# (registry.npmjs.org). Token-auth variant of release.yml, mirroring the
+# aiti-ai/aiti-aigrdpwasm publish-npm.yml decision matrix: dist-pkg is built by
+# scripts/build-package.mjs (tsc + esbuild, all public deps), so there is no
+# gitignored binary to rebuild (unlike the grdpwasm wasm) — the gate is
+# npm ci + build:pkg + tarball verification.
+#
+# Trigger: workflow_dispatch (manual)
+#   dry_run: true (default) — preflight (npm whoami) + npm ci + tests + build
+#     + pack with tarball verification (name/version, private stripped, bundle
+#     present); no publish. false — publish for real.
+#
+# Auth: NPM_TOKEN secret (granular automation token, package write on the
+# @aiti-ai scope) — written into ~/.npmrc by setup-node. release.yml's
+# `environment: release` is an unprotected label here (no approval rule is
+# configured on the org/repo), so this token path does not drop a real gate.
+# Upgrade path (token-free): npmjs Trusted Publishing (OIDC) with --provenance,
+# bound to this repo + workflow once the package is established.
+
+name: NPM Publish
+
+on:
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Dry run (preflight + build + pack verification, no publish)"
+        required: false
+        default: "true"
+        type: choice
+        options:
+          - "true"
+          - "false"
+
+permissions:
+  contents: read
+  id-token: write # npm provenance (add --provenance once Trusted Publishing is bound)
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          registry-url: "https://registry.npmjs.org" # writes ~/.npmrc with NODE_AUTH_TOKEN
+          cache: npm
+
+      - name: Preflight — registry identity
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: npm whoami
+
+      - name: Install dependencies
+        run: npm ci --ignore-scripts
+
+      - name: Test
+        run: npm run test:all
+
+      - name: Build published package (dist-pkg)
+        run: npm run build:pkg
+
+      - name: Pack — verify the dist-pkg tarball is publishable
+        run: |
+          npm pack ./dist-pkg
+          TGZ=$(ls aiti-ai-pi-subagents-*.tgz | head -1)
+          echo "tarball=$TGZ"
+          node -e '
+            const { execSync } = require("child_process");
+            const tgz = process.argv[1];
+            const pkg = JSON.parse(execSync(`tar -xzf "${tgz}" -O package/package.json`).toString());
+            const files = execSync(`tar -tzf "${tgz}"`).toString().split("\n");
+            const fail = (m) => { console.error("::error::" + m); process.exit(1); };
+            if (pkg.name !== "@aiti-ai/pi-subagents") fail(`unexpected name: ${pkg.name}`);
+            if (pkg.private) fail("dist-pkg package.json still has private:true");
+            if (!pkg.version) fail("dist-pkg package.json missing version");
+            if (!files.includes("package/bundle/index.js")) fail("bundle/index.js missing from tarball");
+            console.log(`ok: ${pkg.name}@${pkg.version} (private stripped, bundle present)`);
+          ' "$TGZ"
+
+      - name: Publish
+        if: ${{ inputs.dry_run == 'false' }}
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        # Trusted Publishing upgrade: drop NODE_AUTH_TOKEN, add --provenance
+        run: npm publish ./dist-pkg --access public
+
+      - name: Summary
+        run: |
+          echo "dry_run=${{ inputs.dry_run }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "version=$(node -p "require('./dist-pkg/package.json').name + '@' + require('./dist-pkg/package.json').version")" >> "$GITHUB_STEP_SUMMARY"
