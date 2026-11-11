@@ -63,7 +63,7 @@ import { SUBAGENT_CHILD_ENV, SUBAGENT_PARENT_SESSION_ENV } from "../runs/shared/
 import { disposeChildSessionsForParent } from "../runs/shared/child-session.ts";
 import { resolveHostCaps } from "../host/caps.ts"; // [aiti] host capability gating (turns TUI carrier surfaces off under pi-web)
 import { resolveCurrentSubagentCapabilityCeiling } from "../runs/shared/capability-ceiling.ts";
-import { loadConfig, resolveAsyncByDefault, resolveScheduledStoreRoot } from "./config.ts";
+import { loadConfig, resolveAsyncByDefault, resolveConfigDefaultTimeoutMs, resolveScheduledStoreRoot } from "./config.ts";
 import { buildSubagentToolDescription, buildSubagentToolPromptMetadata } from "./tool-description.ts";
 import { formatWorkflowPreflightSummary, normalizeWorkflowPreflight } from "../workflows/workflow-preflight.ts";
 import { runtimeReplacedAbortReason } from "../workflows/workflow-reuse.ts";
@@ -543,7 +543,7 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 						]),
 					});
 				} catch (error) {
-					console.error("Failed to clean retained async subagent state:", error);
+					reportSessionWarning(state, `Failed to clean retained async subagent state: ${error instanceof Error ? error.message : String(error)}`, "async-retention-cleanup");
 				}
 			}, ASYNC_RETENTION_DELAY_MS);
 			asyncRetentionTimer.unref?.();
@@ -828,7 +828,8 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 			// A headless host may dispose the session as soon as this turn settles, so hand
 			// finished results to Pi now; Pi runs the queued completion turn after agent_end.
 			// A failed drain rejects without this step so its deadline stays exact.
-			if (!ctx.hasUI) await drainOutstandingWork({ state, events: pi.events, hasPendingSupervisorRequest: supervisorChannel.hasPendingRequests }).then(resultWatcher.deliverPendingResults);
+			// The parent ended its turn to wait for the wake, so the drain lasts as long as a run may.
+			if (!ctx.hasUI) await drainOutstandingWork({ state, events: pi.events, hasPendingSupervisorRequest: supervisorChannel.hasPendingRequests, timeoutMs: resolveConfigDefaultTimeoutMs(config.timeoutMs) }).then(resultWatcher.deliverPendingResults);
 		} finally {
 			// Deliver notices after a failed drain without suppressing its rejection.
 			const ownerSessionId = state.currentSessionId;
